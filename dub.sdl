@@ -8,7 +8,6 @@ dependency "vibe-d:data" version="~>0.8.6"
 dependency "vibe-d:inet" version="~>0.8.6"
 
 lflags "-fuse-ld=gold" platform="linux"
-preBuildCommands "$PACKAGE_DIR/version.sh > ./VERSION"
 stringImportPaths "."
 
 configuration "lib" {
