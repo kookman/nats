@@ -1,0 +1,23 @@
+name "nats"
+description "A nats pubsub client for vibe.d"
+authors "kookman"
+copyright "Copyright © 2019-2020, kookman"
+license "MIT"
+dependency "vibe-d:core" version="~>0.8.6"
+dependency "vibe-d:data" version="~>0.8.6"
+dependency "vibe-d:inet" version="~>0.8.6"
+
+lflags "-fuse-ld=gold" platform="linux"
+preBuildCommands "$PACKAGE_DIR/version.sh > ./VERSION"
+stringImportPaths "."
+
+configuration "lib" {
+    targetType "library"
+    excludedSourceFiles "app.d"
+}
+configuration "build-deps" {
+    targetType "none"
+}
+configuration "test-app" {
+    targetType "executable"
+}

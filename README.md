@@ -1,2 +1,2 @@
 # nats
-Nats client library built on vibe.d
+A basic [Nats](http://nats.io) client library for Dlang, built on vibe.d
