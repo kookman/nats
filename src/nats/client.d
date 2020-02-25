@@ -22,6 +22,9 @@ import nats.parser;
 
 enum VERSION = import("VERSION");
 
+// Allow quietening the debug logging from nats client
+version (NatsClientQuiet) {}
+else version = NatsClientLogging;
 
 final class Nats
 {
@@ -60,32 +63,44 @@ final class Nats
 
 	this(string natsUri = "nats://127.0.0.1:4222", string name = null) @trusted
 	{
+		NatsClientConfig config;
+		config.natsUri = natsUri;
+		config.clientId = name;
+		this(config);
+	}
+
+	this(NatsClientConfig config) @trusted
+	{
 		import std.algorithm.searching: findSplit, startsWith;
 		import std.format: format;
 		import vibe.inet.url: URL;
 
-		ushort defaultPort = 4222;
+		immutable ushort defaultPort = 4222;
 		uint schemaSkip;
 	
-		if (natsUri.startsWith("nats:"))
+		if (config.natsUri.startsWith("nats:"))
 		{
 			_useTls = false;
 			schemaSkip = 4;
 		}
-		else if (natsUri.startsWith("tls:"))
+		else if (config.natsUri.startsWith("tls:"))
 		{
 			_useTls = true;
 			schemaSkip = 3;
 		}
 
-		string uri = schemaSkip ? format!"tcp%s"(natsUri[schemaSkip..$]) : natsUri;
+		string uri = schemaSkip ? format!"tcp%s"(config.natsUri[schemaSkip..$]) : config.natsUri;
 		auto url = URL(uri);
 
-		_connectInfo.name = name;
+		_connectInfo.name = config.clientId;
 		_connectInfo.user = url.username;
 		_connectInfo.pass = url.password;
 		_host = url.host;
 		_port = (url.port == 0) ? defaultPort : url.port;
+        _heartbeatInterval = config.heartbeatInterval;
+        _reconnectInterval = config.reconnectInterval;
+        _connectTimeout = config.connectTimeout;
+
 		_flushMutex = new TaskMutex;
 		_writeMutex = new RecursiveTaskMutex;
 		_readIdle = createManualEvent();
@@ -97,7 +112,9 @@ final class Nats
 
 	unittest
 	{
-		auto nats = new Nats("nats://kookman:pass@127.0.0.1:4222");
+		NatsClientConfig testConfig;
+		testConfig.natsUri = "nats://kookman:pass@127.0.0.1:4222";
+		auto nats = new Nats(testConfig);
 		assert (nats._host == "127.0.0.1");
 		assert (nats._port == 4222);
 		assert (nats._connectInfo.user == "kookman");
@@ -109,12 +126,12 @@ final class Nats
 		Mallocator.instance.deallocate(_protocolBuffer);
 		if (_largePayloadBuffer)
 			Mallocator.instance.deallocate(_largePayloadBuffer);
-		logInfo("nats client object destroyed!");
+		version (NatsClientLogging) logDebug("nats client object destroyed!");
 	}
 
 	void connect() @safe
 	{
-		runTask(&connector, 15.seconds);
+		runTask(&connector);
 	}
 
 
@@ -205,7 +222,7 @@ final class Nats
 			_flushSync.wait(timeout, syncEvents);
 			if (_flushSync.emitCount() == syncEvents)
 			{
-				logError("Flush timeout. Disconnected?");
+				logError("nats.client: Flush timeout. Disconnected?");
 				if (!connected())
 					_connState = NatsState.DISCONNECTED;
 			}
@@ -245,9 +262,12 @@ final class Nats
 	ushort               _port;
 	bool 				 _useTls;
 	NatsState			 _connState;
+	Duration			 _heartbeatInterval;
+    Duration             _reconnectInterval;
+    Duration             _connectTimeout;
 
 
-	void connector(Duration reconnectInterval = 15.seconds) @safe
+	void connector() @safe
 	{
 		import vibe.data.json: serializeToJsonString;
 
@@ -257,7 +277,8 @@ final class Nats
 		while (_connState != NatsState.CLOSED)
 		{
 			auto initialState = _connState;
-			logDebug("Connector: Establishing connection to NATS server (%s) port %s ...", _host, _port);
+			version (NatsClientLogging)
+				logDebug("Connector: Establishing connection to NATS server (%s) port %s ...", _host, _port);
 			_conn = connectTCP(_host, _port, null, 0, 5.seconds);
 			if (_conn)
 			{
@@ -266,8 +287,8 @@ final class Nats
 				_conn.readTimeout(10.seconds);
 				_connState = NatsState.CONNECTED;
 				// start the listener & heartbeater tasks		
-				_listener = runTask(&listener, 5.seconds);
-				_heartbeater = runTask(&heartbeater, 5.seconds);
+				_listener = runTask(&listener);
+				_heartbeater = runTask(&heartbeater);
 				// send the CONNECT string
 				cmd = buffer.sformat("CONNECT %s\r\n", serializeToJsonString(_connectInfo));
 				logDebug("Connector: Connected! Sending: %s", cmd[0..$-2]);
@@ -288,7 +309,7 @@ final class Nats
 				sendSubscribe(inbox);
 				if (initialState == NatsState.RECONNECTING)
 				{
-					logInfo("Connector: This is the part where we re-send the subscriptions etc.");
+					logInfo("Connector: This is the part where we *should* re-send the subscriptions etc.");
 					//TODO: Fix this
 				}
 				// go async here until we need to reconnect...
@@ -299,18 +320,18 @@ final class Nats
 				_pongRecv = 0; 
 			}
 			else
-				logWarn("Connector: Connection attempt to %s failed.", _host);
-			sleep(reconnectInterval);
+				logWarn("nats.client Connector: Connection attempt to %s failed.", _host);
+			sleep(_reconnectInterval);
 		}
 	}
 
 
-	void listener(Duration heartbeatInterval = 5.seconds) @safe
+	void listener() @safe
 	{
 		logDebug("NATS listener task started.");
 		while(connected())
 		{
-			auto result = _conn.waitForDataEx(heartbeatInterval);
+			auto result = _conn.waitForDataEx(_heartbeatInterval);
 			if (result == WaitForDataStatus.dataAvailable)
 			{
 				ubyte[] buffer = _protocolBuffer[_fragmentSize..$];
@@ -325,27 +346,27 @@ final class Nats
 			}
 			else if (result == WaitForDataStatus.noMoreData)
 			{
-				logError("Listener read session closed: %s", result);
+				logError("nats.client: Listener read session closed unexpectedly: %s", result);
 				_connState = NatsState.DISCONNECTED;
 			}
 		}
-		logWarn("Nats session disconnected! Listener task terminating. Connector will attempt reconnect.");
+		logWarn("nats.client: Nats session disconnected! Listener task terminating. Connector will attempt reconnect.");
 	}
 
 
-	void heartbeater(Duration heartbeatInterval = 5.seconds) @safe
+	void heartbeater() @safe
 	{
 		while(connected())
 		{
 			auto idleCount = _readIdle.emitCount();
-			_readIdle.wait(heartbeatInterval, idleCount);
-			if (MonoTime.currTime() - _lastFlush > heartbeatInterval)
+			_readIdle.wait(_heartbeatInterval, idleCount);
+			if (MonoTime.currTime() - _lastFlush > _heartbeatInterval)
 			{
 				auto rtt = flush();
-				logDebugV("Heartbeat RTT: %s", rtt);
+				version (NatsClientLogging) logDebugV("Nats Heartbeat RTT: %s", rtt);
 			}
 		}
-		logWarn("Nats session disconnected! Heartbeater task terminating.");
+		logWarn("nats.client: Nats session disconnected! Heartbeater task terminating.");
 	}
 
 
@@ -369,9 +390,11 @@ final class Nats
 		{
 			auto bytesWritten = _conn.write(cast(const(ubyte)[]) buffer, IOMode.all);
 			if (bytesWritten == buffer.length)
-				logTrace("Write ok. %s bytes written.", bytesWritten);
+			{
+				version (NatsClientLogging) logTrace("Write ok. %s bytes written.", bytesWritten);
+			}
 			else 
-				logError("Error writing to Nats connection, status: %s", bytesWritten);
+				logError("nats.client: Error writing to Nats connection, status: %s", bytesWritten);
 			_bytesSent += bytesWritten;
 		}
 	}
@@ -390,13 +413,14 @@ final class Nats
 		{
 			auto msg = parseNats(response[consumed..$]);
 			consumed += msg.consumed;
-			logTrace("Consumed: %s", consumed);
+			version (NatsClientLogging) logTrace("Consumed: %s", consumed);
 
 			final switch (msg.type)
 			{	
 				case NatsResponse.FRAGMENT:
 					_fragmentSize = response.length - consumed;
-					logTrace("Fragment (length: %s) left in buffer. Consolidating with another read.", _fragmentSize);
+					version (NatsClientLogging)
+						logTrace("Fragment (length: %s) left in buffer. Consolidating with another read.", _fragmentSize);
 					remaining = copy(response[consumed..$], _protocolBuffer);
 					break;
 
@@ -405,14 +429,15 @@ final class Nats
 					if (msg.length > msg.payload.length)
 					{
 						auto payloadRead = response.length - consumed;
-						logTrace("MSG payload exceeds initial buffer (length: %s).", msg.length);
+						version (NatsClientLgging) 
+						    logTrace("MSG payload exceeds initial buffer (length: %s).", msg.length);
 						remaining = copy(response[consumed..$], _largePayloadBuffer);
 						payload = remaining[0..msg.length + 2 - payloadRead]; 
 						auto bytesRead = _conn.read(payload, IOMode.all);
 						// should only reach this point once we have completed read successfully
 						if (bytesRead < remaining.length)
 						{
-							logError("Message payload incomplete! (expected: %s)", msg.length + 2);
+							logError("nats.client: Message payload incomplete! (expected: %s)", msg.length + 2);
 							throw new NatsProtocolException("Protocol error while expecting MSG payload.");
 						}
 						_bytesReceived += bytesRead;
@@ -426,7 +451,7 @@ final class Nats
 					if (subscription.msgsReceived > subscription.msgsToExpire)
 						subscription.closed = true;
 					if (subscription.closed)
-						logWarn("Message received on closed subscription! (msg.subject: %s, subscription: %s)", msg.subject, subscription.subject);
+						logWarn("nats.client: Message received on closed subscription! (msg.subject: %s, subscription: %s)", msg.subject, subscription.subject);
 					else
 						subscription.handler(msg);
 					continue;
@@ -434,7 +459,7 @@ final class Nats
 				case NatsResponse.PING:
 					write(PONG);
 					_pongSent++;
-					logDebugV("Pong sent.");
+					version (NatsClientLogging) logDebugV("Pong sent.");
 					continue;
 				
 				case NatsResponse.PONG:
@@ -444,16 +469,16 @@ final class Nats
 					continue;
 
 				case NatsResponse.OK:
-					logDebug("Ok received.");
+					version (NatsClientLogging) logDebug("Ok received.");
 					continue;
 
 				case NatsResponse.INFO:
-					logDebug("Server INFO msg: %s", msg.payloadAsString);
+					version (NatsClientLogging) logDebug("Server INFO msg: %s", msg.payloadAsString);
 					processServerInfo(msg);
 					continue;
 
 				case NatsResponse.ERR:
-					logError("Server ERR msg: %s", msg.payloadAsString);
+					logError("nats.client: Server ERR msg: %s", msg.payloadAsString);
 					continue;
 			}
 		}		
@@ -469,13 +494,15 @@ final class Nats
 		{
 			if (_largePayloadBuffer)
 				Mallocator.instance.deallocate(_largePayloadBuffer);
-			logDebug("Allocating _largePayloadBuffer for max %s bytes.", maxPayload);
+			version (NatsClientLogging) 
+			    logDebug("Allocating _largePayloadBuffer for max %s bytes.", maxPayload);
 			_largePayloadBuffer = cast(ubyte[]) Mallocator.instance.allocate(maxPayload);
 		}
 	}
 
 	void inboxHandler(scope Msg msg) @safe
 	{
-		logDebugV("Inbox %s handler called with msg: %s", msg.subject, msg.payloadAsString);
+		version (NatsClientLogging) 
+		    logDebugV("Inbox %s handler called with msg: %s", msg.subject, msg.payloadAsString);
 	}
 }

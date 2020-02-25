@@ -7,8 +7,6 @@ void main(string[] args)
 {
 	import std.functional: toDelegate;
 
-	string[] args_out;      //to allow addition of non-vibe.d args to command line
-
 	auto nats = new Nats("nats://127.0.0.1:4222", "nats:testClient");
 
 	logInfo("Starting Nats client version: %s", Nats.natsClientVersion);
@@ -28,9 +26,7 @@ void main(string[] args)
 				nats.publish("greetings", cast(ubyte[])"Still there?");
 			});
 
-	runApplication(&args_out);
-
-	nats.destroy();
+	runApplication();
 }
 
 

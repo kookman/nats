@@ -1,5 +1,7 @@
 module nats.interface_;
 
+public import core.time: Duration, seconds;
+
 struct Msg
 {
 	string         subject;
@@ -31,7 +33,6 @@ class Subscription
 	bool		closed;
 }
 
-
 class NatsProtocolException : Exception {
 	this(string message, string file = __FILE__, size_t line = __LINE__, Exception next = null) @safe
 	{
@@ -39,6 +40,14 @@ class NatsProtocolException : Exception {
 	}
 }
 
+struct NatsClientConfig
+{
+    string      natsUri;
+    string      clientId;
+    Duration    heartbeatInterval = 5.seconds;
+    Duration    reconnectInterval = 15.seconds;
+    Duration    connectTimeout = 15.seconds;
+}
 
 enum NatsState : byte { CONNECTING, CONNECTED, DISCONNECTED, RECONNECTING, CLOSED }
 

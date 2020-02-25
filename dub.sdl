@@ -12,11 +12,15 @@ stringImportPaths "."
 
 configuration "lib" {
     targetType "library"
-    excludedSourceFiles "app.d"
+    excludedSourceFiles "src/app.d"
 }
 configuration "build-deps" {
     targetType "none"
 }
 configuration "test-app" {
     targetType "executable"
+}
+configuration "unittest" {
+    excludedSourceFiles "src/app.d"
+    versions "NatsClientQuiet"
 }
