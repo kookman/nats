@@ -14,7 +14,7 @@ import nats.parser;
  |*| Implement flush logic
  | | Implement request-response subscriptions
  |*| Support proper connect options
- | | Support reconnect logic
+ |*| Support reconnect logic
  |*| Support large messages
  |*| Support distributed queues (subscriber groups)
  | | ? Support (de)serialisation protocols: msgpack, cerealed, none (passthru ubyte[])
@@ -90,7 +90,7 @@ final class Nats
         }
 
         string uri = schemaSkip ? format!"tcp%s"(config.natsUri[schemaSkip..$]) : config.natsUri;
-        auto url = URL(uri);
+        auto immutable url = URL(uri);
 
         _connectInfo.name = config.clientId;
         _connectInfo.user = url.username;
@@ -277,10 +277,13 @@ final class Nats
         while (_connState != NatsState.CLOSED)
         {
             auto initialState = _connState;
-            version (NatsClientLogging)
-                logDebug("Connector: Establishing connection to NATS server (%s) port %s ...", _host, _port);
-            _conn = connectTCP(_host, _port, null, 0, 5.seconds);
-            if (_conn)
+            version (NatsClientLogging) logDebug("Connector: Establishing connection to NATS server (%s) port %s ...", _host, _port);
+            try
+                _conn = connectTCP(_host, _port, null, 0, 5.seconds);
+            catch (Exception e) {
+                version (NatsClientLogging) logDebug("nats.client Connector: Exception whilst attempting connect to Nats server, msg: %s", e.msg);
+            }
+            if (_conn.connected)
             {
                 _conn.keepAlive(true);
                 _conn.tcpNoDelay(true);
@@ -291,10 +294,10 @@ final class Nats
                 _heartbeater = runTask(&heartbeater);
                 // send the CONNECT string
                 cmd = buffer.sformat("CONNECT %s\r\n", serializeToJsonString(_connectInfo));
-                logDebug("Connector: Connected! Sending: %s", cmd[0..$-2]);
+                version (NatsClientLogging) logDebug("Connector: Connected! Sending: %s", cmd[0..$-2]);
                 write(cmd);
                 auto rtt = flush();
-                logDebug("Connector: Flush roundtrip (%s) completed. Nats connection ready.", rtt);
+                version (NatsClientLogging) logDebug("Connector: Flush roundtrip (%s) completed. Nats connection ready.", rtt);
                 // create a connection specific inbox subscription
                 auto inbox = new Subscription;
                 inbox.subject = "_INBOX_" ~ _conn.localAddress.toString();
@@ -305,12 +308,14 @@ final class Nats
                     _subs ~= inbox;
                 else
                     _subs[0] = inbox;
-                logDebug("Connector: Sending inbox subscription: %s", inbox.subject);
+                version (NatsClientLogging) logDebug("nats.client Connector: Sending inbox subscription: %s", inbox.subject);
                 sendSubscribe(inbox);
-                if (initialState == NatsState.RECONNECTING)
+                if (initialState == NatsState.RECONNECTING && _subs.length > 1) 
                 {
-                    logInfo("Connector: This is the part where we *should* re-send the subscriptions etc.");
-                    //TODO: Fix this
+                    version (NatsClientLogging) logInfo("nats.client Connector: Re-sending active subscriptions after reconnection to Nats server.");
+                    foreach (priorSubscription; _subs[1..$]) {
+                        if (!priorSubscription.closed) sendSubscribe(priorSubscription);
+                    }
                 }
                 // go async here until we need to reconnect...
                 _listener.join();
@@ -328,7 +333,7 @@ final class Nats
 
     void listener() @safe
     {
-        logDebug("NATS listener task started.");
+        version (NatsClientLogging) logDebug("nats.client: listener task started.");
         while(connected())
         {
             auto result = _conn.waitForDataEx(_heartbeatInterval);
@@ -341,7 +346,7 @@ final class Nats
             }
             else if (result == WaitForDataStatus.timeout)
             {
-                logDebugV("Listener idle: Notifying heartbeater.");
+                version (NatsClientLogging) logDebugV("nats.client Listener idle: Notifying heartbeater.");
                 _readIdle.emit();
             }
             else if (result == WaitForDataStatus.noMoreData)
@@ -356,6 +361,7 @@ final class Nats
 
     void heartbeater() @safe
     {
+        version (NatsClientLogging) logDebug("nats.client: heartbeater task started.");
         while(connected())
         {
             auto idleCount = _readIdle.emitCount();
@@ -391,7 +397,7 @@ final class Nats
             auto bytesWritten = _conn.write(cast(const(ubyte)[]) buffer, IOMode.all);
             if (bytesWritten == buffer.length)
             {
-                version (NatsClientLogging) logTrace("Write ok. %s bytes written.", bytesWritten);
+                version (NatsClientLogging) logTrace("nats.client: Write ok. %s bytes written.", bytesWritten);
             }
             else 
                 logError("nats.client: Error writing to Nats connection, status: %s", bytesWritten);
