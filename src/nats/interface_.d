@@ -4,8 +4,8 @@ public import core.time: Duration, seconds;
 
 struct Msg
 {
-    string         subject;
-    string         replySubject;
+    const(char)[]  subject;
+    const(char)[]  replySubject;
     uint           sid;
     uint           length;
     Subscription   subs;
@@ -13,9 +13,10 @@ struct Msg
     size_t         consumed;
     NatsResponse   type;
 
-    string payloadAsString() @trusted
+    import std.string: assumeUTF;
+    string payloadAsString() @safe
     {
-        return cast(string)payload;
+        return assumeUTF(payload);
     }
 }
 

@@ -1,6 +1,7 @@
 module nats.parser;
 
 import vibe.core.log;
+import std.string: assumeUTF, representation;
 
 import nats.interface_;
 
@@ -8,16 +9,16 @@ import nats.interface_;
 
 package:
 
-enum MSG = cast(ubyte[])"MSG ";
-enum PING = cast(ubyte[])"PING\r\n";
-enum PONG = cast(ubyte[])"PONG\r\n";
-enum OK = cast(ubyte[])"+OK\r\n";
-enum INFO = cast(ubyte[])"INFO ";
-enum ERR = cast(ubyte[])"-ERR ";
-enum CRLF = cast(ubyte[])"\r\n";
+enum MSG = "MSG ".representation;
+enum PING = "PING\r\n".representation;
+enum PONG = "PONG\r\n".representation;
+enum OK = "+OK\r\n".representation;
+enum INFO = "INFO ".representation;
+enum ERR = "-ERR ".representation;
+enum CRLF = "\r\n".representation;
 
 
-Msg parseNats(return scope const ubyte[] response) @safe
+Msg parseNats(return scope const(ubyte)[] response) @safe
 {
     import std.algorithm.searching: findSplitAfter, startsWith;
     import std.algorithm.iteration: splitter;
@@ -40,7 +41,7 @@ Msg parseNats(return scope const ubyte[] response) @safe
     if (protocolLine.startsWith("MSG"))
     {
         auto remaining = fragments[1];
-        auto tokens = () @trusted { return cast(string)protocolLine[4..$]; }().splitter;
+        auto tokens = protocolLine[4..$].assumeUTF.splitter;
         msg.subject = tokens.front;
         tokens.popFront();
         msg.sid = tokens.front.to!uint;
@@ -116,7 +117,7 @@ Msg parseNatsNew(return scope const ubyte[] response) @trusted
         }
         import std.stdio;
         tokenLength = remaining.length - tokenSplitter[0].length;
-        token[tokenCount] = cast(string)remaining[0..tokenLength];
+        token[tokenCount] = assumeUTF(remaining[0..tokenLength]);
         remaining = tokenSplitter[0][tokenSplitter[1]..$];
         msg.consumed += tokenLength + tokenSplitter[1];
         tokenCount++;
@@ -197,7 +198,7 @@ Msg parseNatsNew(return scope const ubyte[] response) @trusted
 }
 
 
-Msg processMsgArgs(const ubyte[] args) @trusted
+Msg processMsgArgs(const(ubyte)[] args) @trusted
 {
     Msg      msg;
     MsgField field;
@@ -212,7 +213,7 @@ Msg processMsgArgs(const ubyte[] args) @trusted
             case MsgField.SUBJECT:
                 switch (b) {
                     case ' ':
-                        msg.subject = cast(string)args[0..i];
+                        msg.subject = assumeUTF(args[0..i]);
                         msg.type = NatsResponse.MSG;
                         field = MsgField.SID;
                         continue;
@@ -233,7 +234,7 @@ Msg processMsgArgs(const ubyte[] args) @trusted
             case MsgField.REPLY:
                 switch (b) {
                     case ' ':
-                        msg.replySubject = cast(string)args[start..i];
+                        msg.replySubject = assumeUTF(args[start..i]);
                         msg.type = NatsResponse.MSG_REPLY;
                         field = MsgField.LENGTH;
                         continue;
@@ -615,12 +616,12 @@ Msg parse(const ubyte[] response) @safe
 }
 
 unittest {
-    enum test_msg = cast(ubyte[])"MSG notices 1 12\r\nHello world!\r\n";
-    enum test_msg_w_reply = cast(ubyte[])"MSG notices 12 reply 29\r\nHello world - please respond!\r\n";
+    enum test_msg = "MSG notices 1 12\r\nHello world!\r\n".representation;
+    enum test_msg_w_reply = "MSG notices 12 reply 29\r\nHello world - please respond!\r\n".representation;
     enum two_messages = test_msg ~ test_msg_w_reply;
-    enum info = cast(ubyte[])`INFO {"server_id":"p5YHW98yUXPd3BTRHoBNAE","version":"1.4.1","proto":1,`
-        ~ cast(ubyte[])`"go":"go1.11.5","host":"0.0.0.0","port":4222,"max_payload":1048576,"client_id":12}`
-        ~ cast(ubyte[])"\r\n";
+    enum info = `INFO {"server_id":"p5YHW98yUXPd3BTRHoBNAE","version":"1.4.1","proto":1,`
+        ~ `"go":"go1.11.5","host":"0.0.0.0","port":4222,"max_payload":1048576,"client_id":12}`
+        ~ "\r\n".representation;
 
     void idiomatic_d()
     { 
