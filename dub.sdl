@@ -1,7 +1,7 @@
 name "nats"
 description "A nats pubsub client for vibe.d"
 authors "kookman"
-copyright "Copyright © 2019-2020, kookman"
+copyright "Copyright © 2019-2021, kookman"
 license "MIT"
 dependency "vibe-d:core" version="~>0.9"
 dependency "vibe-d:data" version="~>0.9"

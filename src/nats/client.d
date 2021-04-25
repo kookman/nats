@@ -352,6 +352,8 @@ final class Nats
             else if (result == WaitForDataStatus.noMoreData)
             {
                 logError("nats.client: Listener read session closed unexpectedly: %s", result);
+                // ensure underlying TCP connection is closed - state might not yet reflect this
+                _conn.close();  
                 _connState = NatsState.DISCONNECTED;
             }
         }
