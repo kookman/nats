@@ -21,7 +21,7 @@ enum SPACE = " ".representation;
 enum TAB = "\t".representation;
 
 
-const(ubyte)[] parseNats(return scope const(ubyte)[] response, out Msg msg) @safe
+size_t parseNats(scope const(ubyte)[] response, out Msg msg) @safe
 {
     import std.algorithm.comparison: equal;
     import std.algorithm.searching: findSplitAfter, startsWith;
@@ -29,15 +29,17 @@ const(ubyte)[] parseNats(return scope const(ubyte)[] response, out Msg msg) @saf
     import std.ascii: isAlpha;
     import std.conv: to;
 
+    size_t consumed = 0;
     auto fragments = response.findSplitAfter(CRLF);
     if (!fragments)
     {
         // we don't have a full NATS protocol line, only a fragment
         msg.type = NatsResponse.FRAGMENT;
-        return response;
+        return consumed;
     }
     auto protocolLine = fragments[0];  
     auto remaining = fragments[1];
+    consumed = response.length - remaining.length;
  
     if (protocolLine.startsWith(MSG))
     {
@@ -60,8 +62,7 @@ const(ubyte)[] parseNats(return scope const(ubyte)[] response, out Msg msg) @saf
         if (msg.length + 2 <= remaining.length)
         {
             msg.payload = remaining[0..msg.length];
-            // skip the CRLF sequence
-            remaining = remaining[msg.length+2..$];
+            consumed += msg.length + 2;   // +2 to skip the CRLF sequence
         }
     }
     else if (protocolLine.startsWith(PONG))
@@ -91,11 +92,11 @@ const(ubyte)[] parseNats(return scope const(ubyte)[] response, out Msg msg) @saf
         logDebug("protocolLine: %s", protocolLine);
         throw new NatsProtocolException("Expected start of a NATS response token.");			
     }
-    return remaining;
+    return consumed;
 }
 
 
-const(ubyte)[] parseNatsNew(return scope const(ubyte)[] response, out Msg msg) @trusted
+size_t parseNatsNew(scope const(ubyte)[] response, out Msg msg) @trusted
 {
     import std.algorithm.searching: find, findSplitBefore;
     import std.conv: to;
@@ -105,6 +106,7 @@ const(ubyte)[] parseNatsNew(return scope const(ubyte)[] response, out Msg msg) @
     uint tokenCount;
     ulong tokenLength;
 
+    size_t consumed = 0;
     auto remaining = response;
     loop: do
     {
@@ -112,7 +114,7 @@ const(ubyte)[] parseNatsNew(return scope const(ubyte)[] response, out Msg msg) @
         if (!tokenSplitter[1])
         {
             msg.type = NatsResponse.FRAGMENT;
-            return remaining;		
+            return consumed;		
         }
         tokenLength = remaining.length - tokenSplitter[0].length;
         token[tokenCount] = remaining[0..tokenLength].assumeUTF.assumeUnique;
@@ -184,11 +186,10 @@ const(ubyte)[] parseNatsNew(return scope const(ubyte)[] response, out Msg msg) @
         if (msg.length + 2 <= remaining.length)
         {
             msg.payload = remaining[0..msg.length];
-            remaining = remaining[msg.length + 2 .. $];  		
+            consumed += msg.length + 2;
         }
-
     } 
-    return remaining;
+    return consumed;
 }
 
 
@@ -251,7 +252,7 @@ Msg processMsgArgs(const(ubyte)[] args) @trusted
 
 
 
-const(ubyte)[] parse(const(ubyte)[] response, out Msg msg) @safe
+size_t parse(const(ubyte)[] response, out Msg msg) @safe
 {
     CmdState cmd;
     ubyte b;
@@ -429,7 +430,6 @@ const(ubyte)[] parse(const(ubyte)[] response, out Msg msg) @safe
                         continue;
                     case '\n':
                         msg.type = NatsResponse.PONG;
-                        //processPong();
                         start = i+1;
                         drop = 0;
                         cmd = CmdState.OP_START;
@@ -461,7 +461,6 @@ const(ubyte)[] parse(const(ubyte)[] response, out Msg msg) @safe
                         continue;
                     case '\n':
                         msg.type = NatsResponse.PING;
-                        //processPing();
                         start = i+1;
                         drop = 0;
                         cmd = CmdState.OP_START;
@@ -599,12 +598,8 @@ const(ubyte)[] parse(const(ubyte)[] response, out Msg msg) @safe
     {
         // anything else means we have ended on a fragmented Nats command
         msg.type = NatsResponse.FRAGMENT;
-        return response;
     }
-    else
-    {
-        return response[start..$];
-    }
+    return response.length - start;
 }
 
 unittest {

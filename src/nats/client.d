@@ -418,16 +418,16 @@ final class Nats
     }
 
 
-    const(ubyte)[] processNatsStream(return scope const(ubyte)[] response) @safe
+    size_t processNatsStream(scope const(ubyte)[] response) @safe
     {
-        auto remaining = response;
+        size_t consumed = 0;
         Subscription subscription;
     
-        while(remaining.length > 0)
+        while(consumed < response.length)
         {
             Msg msg;
-            remaining = parseNats(remaining, msg);
-            version (NatsClientLogging) logTrace("Remaining NATS stream length: %s", remaining.length);
+            consumed += parseNats(response[consumed..$], msg);
+            version (NatsClientLogging) logTrace("Remaining NATS stream length: %s", response.length - consumed);
 
             final switch (msg.type)
             {	
@@ -439,13 +439,13 @@ final class Nats
                     immutable payloadRead = msg.payload.length;
                     if (msg.length > payloadRead)
                     {
-                        assert(remaining.length == 0);
+                        assert(response.length == consumed);
                         version (NatsClientLgging) 
                             logTrace("MSG payload exceeds initial buffer (length: %s).", msg.length);
                         auto gcPayload = new ubyte[msg.length];
                         gcPayload[0..payloadRead] = msg.payload[];
                         immutable bytesRead = _conn.read(gcPayload[payloadRead..$], IOMode.all);
-                        if (bytesRead < remaining.length)
+                        if (bytesRead < msg.length - payloadRead)
                         {
                             logError("nats.client: Message payload incomplete! (expected: %s)", msg.length + 2);
                             throw new NatsProtocolException("Protocol error while expecting MSG payload.");
@@ -494,7 +494,7 @@ final class Nats
                     continue;
             }
         }
-        return remaining;		
+        return consumed;		
     }
 
     void processServerInfo(scope Msg msg) @trusted
