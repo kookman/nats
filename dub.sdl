@@ -6,6 +6,7 @@ license "MIT"
 dependency "vibe-d:core" version="~>0.9"
 dependency "vibe-d:data" version="~>0.9"
 dependency "vibe-d:inet" version="~>0.9"
+dependency "nbuff" version="~>0.1"
 
 lflags "-fuse-ld=gold" platform="linux"
 stringImportPaths "."

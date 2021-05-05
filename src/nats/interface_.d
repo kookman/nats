@@ -10,7 +10,6 @@ struct Msg
     uint           length;
     Subscription   subs;
     const(ubyte)[] payload;
-    size_t         consumed;
     NatsResponse   type;
 
     import std.string: assumeUTF;

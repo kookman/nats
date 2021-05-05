@@ -16,31 +16,30 @@ enum OK = "+OK\r\n".representation;
 enum INFO = "INFO ".representation;
 enum ERR = "-ERR ".representation;
 enum CRLF = "\r\n".representation;
+enum SPACE = " ".representation;
+enum TAB = "\t".representation;
 
 
-Msg parseNats(return scope const(ubyte)[] response) @safe
+const(ubyte)[] parseNats(scope const(ubyte)[] response, out Msg msg) @safe
 {
+    import std.algorithm.comparison: equal;
     import std.algorithm.searching: findSplitAfter, startsWith;
     import std.algorithm.iteration: splitter;
     import std.ascii: isAlpha;
     import std.conv: to;
-
-    Msg msg;
 
     auto fragments = response.findSplitAfter(CRLF);
     if (!fragments)
     {
         // we don't have a full NATS protocol line, only a fragment
         msg.type = NatsResponse.FRAGMENT;
-        return msg;
+        return response;
     }
-
     auto protocolLine = fragments[0];  
-    msg.consumed = protocolLine.length;
-
-    if (protocolLine.startsWith("MSG"))
+    auto remaining = fragments[1];
+ 
+    if (protocolLine.startsWith(MSG))
     {
-        auto remaining = fragments[1];
         auto tokens = protocolLine[4..$].assumeUTF.splitter;
         msg.subject = tokens.front;
         tokens.popFront();
@@ -60,7 +59,8 @@ Msg parseNats(return scope const(ubyte)[] response) @safe
         if (msg.length + 2 <= remaining.length)
         {
             msg.payload = remaining[0..msg.length];
-            msg.consumed += msg.length+2;
+            // skip the CRLF sequence
+            remaining = remaining[msg.length+2..$];
         }
     }
     else if (protocolLine.startsWith("PONG"))
@@ -90,11 +90,11 @@ Msg parseNats(return scope const(ubyte)[] response) @safe
         logDebug("protocolLine: %s", protocolLine);
         throw new NatsProtocolException("Expected start of a NATS response token.");			
     }
-    return msg;
+    return remaining;
 }
 
 
-Msg parseNatsNew(return scope const ubyte[] response) @trusted
+const(ubyte)[] parseNatsNew(scope const(ubyte)[] response, out Msg msg) @trusted
 {
     import std.algorithm.searching: find, findSplitBefore;
     import std.conv: to;
@@ -103,23 +103,19 @@ Msg parseNatsNew(return scope const ubyte[] response) @trusted
     bool wholeLine;
     uint tokenCount;
     ulong tokenLength;
-    Msg msg;
 
-    const(ubyte)[] remaining = response;
+    auto remaining = response;
     loop: do
     {
         auto tokenSplitter = remaining.find(' ',CRLF);
         if (!tokenSplitter[1])
         {
             msg.type = NatsResponse.FRAGMENT;
-            msg.consumed = 0;
-            return msg;		
+            return remaining;		
         }
-        import std.stdio;
         tokenLength = remaining.length - tokenSplitter[0].length;
         token[tokenCount] = assumeUTF(remaining[0..tokenLength]);
         remaining = tokenSplitter[0][tokenSplitter[1]..$];
-        msg.consumed += tokenLength + tokenSplitter[1];
         tokenCount++;
         if (tokenSplitter[1] == 2)
         {
@@ -158,7 +154,6 @@ Msg parseNatsNew(return scope const ubyte[] response) @trusted
                 if (payload)
                 {
                     msg.payload = payload[0][5..$];
-                    msg.consumed += payload.length + 2;
                 } 
                 else
                     msg.type = NatsResponse.FRAGMENT;
@@ -185,16 +180,14 @@ Msg parseNatsNew(return scope const ubyte[] response) @trusted
             msg.replySubject = token[3];
             msg.length = token[4].to!uint;								
         }
-        if (msg.length + 2 <= response.length - msg.consumed)
+        if (msg.length + 2 <= remaining.length)
         {
-            msg.payload = response[msg.consumed..msg.consumed + msg.length];
-            msg.consumed += msg.length + 2;  		
+            msg.payload = remaining[0..msg.length];
+            remaining = remaining[msg.length + 2 .. $];  		
         }
 
     } 
-    else if (msg.type == NatsResponse.FRAGMENT)
-        msg.consumed = 0;
-    return msg;
+    return remaining;
 }
 
 
@@ -257,13 +250,12 @@ Msg processMsgArgs(const(ubyte)[] args) @trusted
 
 
 
-Msg parse(const ubyte[] response) @safe
+const(ubyte)[] parse(const(ubyte)[] response, out Msg msg) @safe
 {
     CmdState cmd;
     ubyte b;
     uint start;
     uint drop;
-    Msg msg;
 
     msgloop:
     for (uint i; i < response.length; i++)
@@ -606,13 +598,12 @@ Msg parse(const ubyte[] response) @safe
     {
         // anything else means we have ended on a fragmented Nats command
         msg.type = NatsResponse.FRAGMENT;
-        msg.consumed = 0;
+        return response;
     }
     else
     {
-        msg.consumed = start;
+        return response[start..$];
     }
-    return msg;
 }
 
 unittest {
