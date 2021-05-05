@@ -347,12 +347,12 @@ final class Nats
                 // convert to immutable buffer and process
                 auto natsProtocolChunk = NbuffChunk(readBuffer, bytesRead);
                 buffer.append(natsProtocolChunk);
-                auto remaining = processNatsStream(buffer.data());
+                auto consumed = processNatsStream(buffer.data());
                 version (NatsClientLogging) {
-                    if (remaining.length > 0)
-                        logTrace("Fragment (length: %s) left in buffer. Consolidating with another read.", remaining.length);
+                    if (consumed < buffer.length)
+                        logTrace("Fragment (length: %s) left in buffer. Consolidating with another read.", buffer.length - consumed);
                 }
-                buffer = Nbuff(remaining);
+                buffer.pop(consumed);
             }
             else if (result == WaitForDataStatus.timeout)
             {
