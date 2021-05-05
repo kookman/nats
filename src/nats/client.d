@@ -1,6 +1,5 @@
 module nats.client;
 
-import nbuff;
 import vibe.core.core;
 import vibe.core.log;
 import core.time;
@@ -38,6 +37,7 @@ final class Nats
     import vibe.core.sync: LocalManualEvent, RecursiveTaskMutex, TaskMutex,
             createManualEvent;
     import vibe.data.json: Json;
+    import nbuff: Nbuff, NbuffChunk;
 
     public:
 
@@ -134,7 +134,7 @@ final class Nats
     }
 
 
-    bool connected() @safe nothrow
+    bool connected() @safe const nothrow
     {
         return (_connState == NatsState.CONNECTED && _conn.connected);
     }
@@ -401,7 +401,7 @@ final class Nats
     }
 
 
-    void write(T)(inout T[] buffer) @safe
+    void write(T)(scope inout T[] buffer) @safe
         if (is(Unqual!T == ubyte) || is(Unqual!T == char))
     {
         synchronized(_writeMutex)

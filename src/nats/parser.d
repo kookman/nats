@@ -1,6 +1,7 @@
 module nats.parser;
 
 import vibe.core.log;
+import std.exception: assumeUnique;
 import std.string: assumeUTF, representation;
 
 import nats.interface_;
@@ -20,7 +21,7 @@ enum SPACE = " ".representation;
 enum TAB = "\t".representation;
 
 
-const(ubyte)[] parseNats(scope const(ubyte)[] response, out Msg msg) @safe
+const(ubyte)[] parseNats(return scope const(ubyte)[] response, out Msg msg) @safe
 {
     import std.algorithm.comparison: equal;
     import std.algorithm.searching: findSplitAfter, startsWith;
@@ -63,24 +64,24 @@ const(ubyte)[] parseNats(scope const(ubyte)[] response, out Msg msg) @safe
             remaining = remaining[msg.length+2..$];
         }
     }
-    else if (protocolLine.startsWith("PONG"))
+    else if (protocolLine.startsWith(PONG))
     {
         msg.type = NatsResponse.PONG;
     }
-    else if (protocolLine.startsWith("PING"))
+    else if (protocolLine.startsWith(PING))
     {
         msg.type = NatsResponse.PING;
     }
-    else if (protocolLine.startsWith("+OK"))
+    else if (protocolLine.startsWith(OK))
     {
         msg.type = NatsResponse.OK;
     }
-    else if (protocolLine.startsWith("INFO"))
+    else if (protocolLine.startsWith(INFO))
     {
         msg.type = NatsResponse.INFO;
         msg.payload = protocolLine[5..$-2];
     }
-    else if (protocolLine.startsWith("-ERR"))
+    else if (protocolLine.startsWith(ERR))
     {
         msg.type = NatsResponse.ERR;
         msg.payload = protocolLine[5..$-2];
@@ -94,7 +95,7 @@ const(ubyte)[] parseNats(scope const(ubyte)[] response, out Msg msg) @safe
 }
 
 
-const(ubyte)[] parseNatsNew(scope const(ubyte)[] response, out Msg msg) @trusted
+const(ubyte)[] parseNatsNew(return scope const(ubyte)[] response, out Msg msg) @trusted
 {
     import std.algorithm.searching: find, findSplitBefore;
     import std.conv: to;
@@ -114,7 +115,7 @@ const(ubyte)[] parseNatsNew(scope const(ubyte)[] response, out Msg msg) @trusted
             return remaining;		
         }
         tokenLength = remaining.length - tokenSplitter[0].length;
-        token[tokenCount] = assumeUTF(remaining[0..tokenLength]);
+        token[tokenCount] = remaining[0..tokenLength].assumeUTF.assumeUnique;
         remaining = tokenSplitter[0][tokenSplitter[1]..$];
         tokenCount++;
         if (tokenSplitter[1] == 2)
