@@ -1,6 +1,5 @@
 module nats.parser;
 
-import vibe.core.log;
 import std.exception: assumeUnique;
 import std.string: assumeUTF, representation;
 
@@ -10,12 +9,12 @@ import nats.interface_;
 
 package:
 
-enum MSG = "MSG ".representation;
-enum PING = "PING\r\n".representation;
-enum PONG = "PONG\r\n".representation;
-enum OK = "+OK\r\n".representation;
-enum INFO = "INFO ".representation;
-enum ERR = "-ERR ".representation;
+enum MSG = "MSG".representation;
+enum PING = "PING".representation;
+enum PONG = "PONG".representation;
+enum OK = "+OK".representation;
+enum INFO = "INFO".representation;
+enum ERR = "-ERR".representation;
 enum CRLF = "\r\n".representation;
 enum SPACE = " ".representation;
 enum TAB = "\t".representation;
@@ -30,6 +29,7 @@ size_t parseNats(scope const(ubyte)[] response, out Msg msg) @safe
     import std.conv: to;
 
     size_t consumed = 0;
+    
     auto fragments = response.findSplitAfter(CRLF);
     if (!fragments)
     {
@@ -37,7 +37,13 @@ size_t parseNats(scope const(ubyte)[] response, out Msg msg) @safe
         msg.type = NatsResponse.FRAGMENT;
         return consumed;
     }
-    auto protocolLine = fragments[0];  
+    auto protocolLine = fragments[0];
+    if (protocolLine.length == 2)
+    {
+        // drop a line consisting only of leading CRLF
+        msg.type = NatsResponse.FRAGMENT;
+        return consumed + 2;
+    }  
     auto remaining = fragments[1];
     consumed = response.length - remaining.length;
  
@@ -59,11 +65,6 @@ size_t parseNats(scope const(ubyte)[] response, out Msg msg) @safe
             msg.type = NatsResponse.MSG;
         }
         msg.length = tokens.front.to!uint;
-        if (msg.length + 2 <= remaining.length)
-        {
-            msg.payload = remaining[0..msg.length];
-            consumed += msg.length + 2;   // +2 to skip the CRLF sequence
-        }
     }
     else if (protocolLine.startsWith(PONG))
     {
@@ -89,7 +90,11 @@ size_t parseNats(scope const(ubyte)[] response, out Msg msg) @safe
     }
     else
     {
-        logDebug("protocolLine: %s", protocolLine);
+        version(Have_vibe_core)
+        {
+            import vibe.core.log;
+            logDebug("protocolLine: %s", protocolLine);
+        }
         throw new NatsProtocolException("Expected start of a NATS response token.");			
     }
     return consumed;
@@ -193,9 +198,8 @@ size_t parseNatsNew(scope const(ubyte)[] response, out Msg msg) @trusted
 }
 
 
-Msg processMsgArgs(const(ubyte)[] args) @trusted
+void processMsgArgs(scope const(ubyte)[] args, out Msg msg) @trusted
 {
-    Msg      msg;
     MsgField field;
     ubyte    b;
     size_t   start;
@@ -245,14 +249,13 @@ Msg processMsgArgs(const(ubyte)[] args) @trusted
                     default:
                         break;
                 } 
-        }
+        }        
     }
-    return msg;
 }
 
 
 
-size_t parse(const(ubyte)[] response, out Msg msg) @safe
+size_t parse(scope const(ubyte)[] response, out Msg msg) @trusted
 {
     CmdState cmd;
     ubyte b;
@@ -331,7 +334,7 @@ size_t parse(const(ubyte)[] response, out Msg msg) @safe
                         drop = 1;
                         continue;
                     case '\n':
-                        msg = processMsgArgs(response[start..i-drop]);
+                        processMsgArgs(response[start..i-drop], msg);
                         start = i+1;
                         drop = 0;
                         cmd = CmdState.MSG_PAYLOAD;
@@ -340,18 +343,8 @@ size_t parse(const(ubyte)[] response, out Msg msg) @safe
                         continue;
                 }
             case CmdState.MSG_PAYLOAD:
-                if (msg.length + 2 > response.length - start)
-                {
-                    // large message
-                    break msgloop;
-                }
-                else
-                {
-                    msg.payload = response[start..start+msg.length];
-                    i += msg.length;
-                    cmd = CmdState.MSG_END;
-                    continue;
-                }
+                break msgloop;
+
             case CmdState.MSG_END:
                 switch (b) {
                     case '\n':
@@ -606,141 +599,154 @@ unittest {
     enum test_msg = "MSG notices 1 12\r\nHello world!\r\n".representation;
     enum test_msg_w_reply = "MSG notices 12 reply 29\r\nHello world - please respond!\r\n".representation;
     enum two_messages = test_msg ~ test_msg_w_reply;
-    enum info = `INFO {"server_id":"p5YHW98yUXPd3BTRHoBNAE","version":"1.4.1","proto":1,`
-        ~ `"go":"go1.11.5","host":"0.0.0.0","port":4222,"max_payload":1048576,"client_id":12}`
+    enum info = `INFO {"server_id":"p5YHW98yUXPd3BTRHoBNAE","version":"1.4.1","proto":1,`.representation
+        ~ `"go":"go1.11.5","host":"0.0.0.0","port":4222,"max_payload":1048576,"client_id":12}`.representation
         ~ "\r\n".representation;
 
     void idiomatic_d()
     { 
         Msg msg1, msg2;
+        size_t consumed;
         
-        msg1 = parseNats(test_msg);
+        consumed = parseNats(test_msg, msg1);
+        assert(consumed == 18);
         assert(msg1.type == NatsResponse.MSG);
         assert(msg1.subject == "notices");
-        assert(msg1.payload == "Hello world!");
         assert(msg1.sid == 1);
+        assert(test_msg[consumed..$] == "Hello world!\r\n");
 
-        msg2 = parseNats(test_msg_w_reply);
+        consumed = parseNats(test_msg_w_reply, msg2);
+        assert(consumed == 25);
         assert(msg2.type == NatsResponse.MSG_REPLY);
         assert(msg2.subject == "notices");
-        assert(msg2.payload == "Hello world - please respond!");
         assert(msg2.replySubject == "reply");
         assert(msg2.sid == 12);	
+        assert(test_msg_w_reply[consumed..$] == "Hello world - please respond!\r\n");
 
-        msg1 = parseNats(two_messages);
-        assert(msg1.payload == "Hello world!");
-        assert(msg1.sid == 1);
+        msg1 = Msg.init;
+        msg2 = Msg.init;
+        consumed = parseNats(two_messages, msg1);
+        assert(msg1.subject == "notices");
+        assert(msg1.length == 12);
+        consumed += msg1.length;
+        consumed += parseNats(two_messages[consumed .. $], msg2);
+        assert(msg2.type == NatsResponse.FRAGMENT);
+        msg2 = Msg.init;
+        consumed += parseNats(two_messages[consumed .. $], msg2);
+        assert(msg2.type == NatsResponse.MSG_REPLY);
+        assert(msg2.replySubject == "reply");
+        assert(msg2.length == 29);       
 
-        ubyte[] remaining = two_messages[msg1.consumed..$];
-        msg2 = parseNats(remaining);
-        assert(msg2.payload == "Hello world - please respond!");
-        assert(msg2.sid == 12);	
-
-        msg1 = parseNats(test_msg[0..12]);
+        msg1 = Msg.init;
+        consumed = parseNats(test_msg[0..17], msg1);
         assert(msg1.type == NatsResponse.FRAGMENT);
-        assert(msg1.consumed == 0);
+        assert(consumed == 0);
 
-        msg1 = parseNats(info[0..65]);
+        msg1 = Msg.init;
+        consumed = parseNats(info[0..65], msg1);
         assert(msg1.type == NatsResponse.FRAGMENT);
-        assert(msg1.consumed == 0);
+        assert(consumed == 0);
 
-        msg1 = parseNats(info);
+        msg1 = Msg.init;
+        consumed = parseNats(info, msg1);
         assert(msg1.type == NatsResponse.INFO);
         assert(msg1.payloadAsString == 
             `{"server_id":"p5YHW98yUXPd3BTRHoBNAE","version":"1.4.1","proto":1,`
             ~ `"go":"go1.11.5","host":"0.0.0.0","port":4222,"max_payload":1048576,"client_id":12}`);
     }
+    idiomatic_d();
 
-    void idiomatic_d_new()
-    { 
-        Msg msg1, msg2;
+    // void idiomatic_d_new()
+    // { 
+    //     Msg msg1, msg2;
         
-        msg1 = parseNatsNew(test_msg);
-        assert(msg1.type == NatsResponse.MSG);
-        assert(msg1.subject == "notices");
-        assert(msg1.payload == "Hello world!");
-        assert(msg1.sid == 1);
+    //     msg1 = parseNatsNew(test_msg);
+    //     assert(msg1.type == NatsResponse.MSG);
+    //     assert(msg1.subject == "notices");
+    //     assert(msg1.payload == "Hello world!");
+    //     assert(msg1.sid == 1);
 
-        msg2 = parseNatsNew(test_msg_w_reply);
-        assert(msg2.type == NatsResponse.MSG_REPLY);
-        assert(msg2.subject == "notices");
-        assert(msg2.payload == "Hello world - please respond!");
-        assert(msg2.replySubject == "reply");
-        assert(msg2.sid == 12);	
+    //     msg2 = parseNatsNew(test_msg_w_reply);
+    //     assert(msg2.type == NatsResponse.MSG_REPLY);
+    //     assert(msg2.subject == "notices");
+    //     assert(msg2.payload == "Hello world - please respond!");
+    //     assert(msg2.replySubject == "reply");
+    //     assert(msg2.sid == 12);	
 
-        msg1 = parseNatsNew(two_messages);
-        assert(msg1.payload == "Hello world!");
-        assert(msg1.sid == 1);
+    //     msg1 = parseNatsNew(two_messages);
+    //     assert(msg1.payload == "Hello world!");
+    //     assert(msg1.sid == 1);
 
-        ubyte[] remaining = two_messages[msg1.consumed..$];
-        msg2 = parseNatsNew(remaining);
-        assert(msg2.payload == "Hello world - please respond!");
-        assert(msg2.sid == 12);	
+    //     ubyte[] remaining = two_messages[msg1.consumed..$];
+    //     msg2 = parseNatsNew(remaining);
+    //     assert(msg2.payload == "Hello world - please respond!");
+    //     assert(msg2.sid == 12);	
 
-        msg1 = parseNatsNew(test_msg[0..12]);
-        assert(msg1.type == NatsResponse.FRAGMENT);
-        assert(msg1.consumed == 0);
+    //     msg1 = parseNatsNew(test_msg[0..12]);
+    //     assert(msg1.type == NatsResponse.FRAGMENT);
+    //     assert(msg1.consumed == 0);
 
-        msg1 = parseNatsNew(info[0..65]);
-        assert(msg1.type == NatsResponse.FRAGMENT);
-        assert(msg1.consumed == 0);
+    //     msg1 = parseNatsNew(info[0..65]);
+    //     assert(msg1.type == NatsResponse.FRAGMENT);
+    //     assert(msg1.consumed == 0);
 
-        msg1 = parseNatsNew(info);
-        assert(msg1.type == NatsResponse.INFO);
-        assert(msg1.payloadAsString == 
-            `{"server_id":"p5YHW98yUXPd3BTRHoBNAE","version":"1.4.1","proto":1,`
-            ~ `"go":"go1.11.5","host":"0.0.0.0","port":4222,"max_payload":1048576,"client_id":12}`);
-    }
+    //     msg1 = parseNatsNew(info);
+    //     assert(msg1.type == NatsResponse.INFO);
+    //     assert(msg1.payloadAsString == 
+    //         `{"server_id":"p5YHW98yUXPd3BTRHoBNAE","version":"1.4.1","proto":1,`
+    //         ~ `"go":"go1.11.5","host":"0.0.0.0","port":4222,"max_payload":1048576,"client_id":12}`);
+    // }
 
-    void go_port()
-    {
-        Msg msg1, msg2;
+    // void go_port()
+    // {
+    //     Msg msg1, msg2;
         
-        msg1 = parse(test_msg);
-        assert(msg1.type == NatsResponse.MSG);
-        assert(msg1.subject == "notices");
-        assert(msg1.payload == "Hello world!");
-        assert(msg1.sid == 1);
+    //     msg1 = parse(test_msg);
+    //     assert(msg1.type == NatsResponse.MSG);
+    //     assert(msg1.subject == "notices");
+    //     assert(msg1.payload == "Hello world!");
+    //     assert(msg1.sid == 1);
 
-        msg2 = parse(test_msg_w_reply);
-        assert(msg2.type == NatsResponse.MSG_REPLY);
-        assert(msg2.subject == "notices");
-        assert(msg2.payload == "Hello world - please respond!");
-        assert(msg2.replySubject == "reply");
-        assert(msg2.sid == 12);	
+    //     msg2 = parse(test_msg_w_reply);
+    //     assert(msg2.type == NatsResponse.MSG_REPLY);
+    //     assert(msg2.subject == "notices");
+    //     assert(msg2.payload == "Hello world - please respond!");
+    //     assert(msg2.replySubject == "reply");
+    //     assert(msg2.sid == 12);	
 
-        msg1 = parse(two_messages);
-        assert(msg1.payload == "Hello world!");
-        assert(msg1.sid == 1);
+    //     msg1 = parse(two_messages);
+    //     assert(msg1.payload == "Hello world!");
+    //     assert(msg1.sid == 1);
 
-        ubyte[] remaining = two_messages[msg1.consumed..$];
-        msg2 = parse(remaining);
-        assert(msg2.payload == "Hello world - please respond!");
-        assert(msg2.sid == 12);	
+    //     ubyte[] remaining = two_messages[msg1.consumed..$];
+    //     msg2 = parse(remaining);
+    //     assert(msg2.payload == "Hello world - please respond!");
+    //     assert(msg2.sid == 12);	
 
-        msg1 = parse(test_msg[0..12]);
-        assert(msg1.type == NatsResponse.FRAGMENT);
-        assert(msg1.consumed == 0);
+    //     msg1 = parse(test_msg[0..12]);
+    //     assert(msg1.type == NatsResponse.FRAGMENT);
+    //     assert(msg1.consumed == 0);
 
-        msg1 = parse(info[0..65]);
-        assert(msg1.type == NatsResponse.FRAGMENT);
-        assert(msg1.consumed == 0);
+    //     msg1 = parse(info[0..65]);
+    //     assert(msg1.type == NatsResponse.FRAGMENT);
+    //     assert(msg1.consumed == 0);
 
-        msg1 = parse(info);
-        assert(msg1.type == NatsResponse.INFO);
-        assert(msg1.payloadAsString == 
-            `{"server_id":"p5YHW98yUXPd3BTRHoBNAE","version":"1.4.1","proto":1,`
-            ~ `"go":"go1.11.5","host":"0.0.0.0","port":4222,"max_payload":1048576,"client_id":12}`);
-    }
+    //     msg1 = parse(info);
+    //     assert(msg1.type == NatsResponse.INFO);
+    //     assert(msg1.payloadAsString == 
+    //         `{"server_id":"p5YHW98yUXPd3BTRHoBNAE","version":"1.4.1","proto":1,`
+    //         ~ `"go":"go1.11.5","host":"0.0.0.0","port":4222,"max_payload":1048576,"client_id":12}`);
+    // }
 
     import std.datetime.stopwatch: benchmark;
     import std.stdio: writeln;
 
-    auto results = benchmark!(idiomatic_d, idiomatic_d_new, go_port)(1_000);
+    // auto results = benchmark!(idiomatic_d, idiomatic_d_new, go_port)(1_000);
+    auto results = benchmark!(idiomatic_d)(1_000);
 
     writeln("7000x idiomatic_d parser: ", results[0]);
-    writeln("7000x idiomatic_d_new parser: ", results[1]);
-    writeln("7000x go_natsparser_port: ", results[2]);	
+    // writeln("7000x idiomatic_d_new parser: ", results[1]);
+    // writeln("7000x go_natsparser_port: ", results[2]);	
 
 }
 

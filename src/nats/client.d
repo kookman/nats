@@ -37,7 +37,7 @@ final class Nats
     import vibe.core.sync: LocalManualEvent, RecursiveTaskMutex, TaskMutex,
             createManualEvent;
     import vibe.data.json: Json;
-    import nbuff: Nbuff, NbuffChunk;
+    import nbuff: Nbuff;
 
     public:
 
@@ -123,8 +123,6 @@ final class Nats
 
     ~this() @trusted
     {
-        if (_largePayloadBuffer)
-            Mallocator.instance.deallocate(_largePayloadBuffer);
         version (NatsClientLogging) logDebug("nats client object destroyed!");
     }
 
@@ -182,12 +180,12 @@ final class Nats
         if (msgsToDrain > 0)
         {
             s.msgsToExpire = s.msgsReceived + msgsToDrain;
-            cmd = buffer.sformat!"UNSUB %s %s\r\n"(s.sid, msgsToDrain);			
+            cmd = buffer.sformat!"UNSUB %s %s"(s.sid, msgsToDrain);			
         }
         else
         {
             s.closed = true;
-            cmd = buffer.sformat!"UNSUB %s\r\n"(s.sid);			
+            cmd = buffer.sformat!"UNSUB %s"(s.sid);			
         }
         write(cmd);
     }
@@ -198,13 +196,12 @@ final class Nats
         char[OUTCMD_BUFSIZE] buffer = void;
         char[] cmd;
     
-        cmd = buffer.sformat!"PUB %s %s\r\n"(subject, payload.length);
-        // ensure we don't yield between writing PUB command & payload
+        cmd = buffer.sformat!"PUB %s %s"(subject, payload.length);
+        // ensure we don't interleave other writes between writing PUB command & payload
         synchronized(_writeMutex)
         {
             write(cmd);
             write(payload);
-            write(CRLF);
             _msgSent++;
         }
     }
@@ -254,7 +251,6 @@ final class Nats
     uint                 _pingRecv;
     uint                 _pongSent;
     Subscription[]       _subs;
-    ubyte[]		         _largePayloadBuffer;
     ConnectInfo          _connectInfo;
     Json 				 _info;
     string               _host;
@@ -289,8 +285,8 @@ final class Nats
                 _listener = runTask(&listener);
                 _heartbeater = runTask(&heartbeater);
                 // send the CONNECT string
-                cmd = buffer.sformat("CONNECT %s\r\n", serializeToJsonString(_connectInfo));
-                version (NatsClientLogging) logDebug("Connector: Connected! Sending: %s", cmd[0..$-2]);
+                cmd = buffer.sformat("CONNECT %s", serializeToJsonString(_connectInfo));
+                version (NatsClientLogging) logDebug("Connector: Connected! Sending: %s", cmd);
                 write(cmd);
                 auto rtt = flush();
                 version (NatsClientLogging) logDebug("Connector: Flush roundtrip (%s) completed. Nats connection ready.", rtt);
@@ -340,18 +336,17 @@ final class Nats
             if (result == WaitForDataStatus.dataAvailable)
             {
                 auto readBuffer = Nbuff.get(readSize);
-                auto readBufferData = readBuffer.data();
-                pragma(msg,"readBuffer.data: ", typeof(readBufferData));
-                immutable bytesRead = _conn.read(readBufferData, IOMode.once);
+                auto readBufferSpace = () @trusted { return readBuffer.data(); }();
+                immutable bytesRead = _conn.read(readBufferSpace, IOMode.once);
                 _bytesReceived += bytesRead;
-                // convert to immutable buffer and process
-                auto natsProtocolChunk = NbuffChunk(readBuffer, bytesRead);
-                buffer.append(natsProtocolChunk);
-                auto consumed = processNatsStream(buffer.data());
+                // append this newly read chunk to the buffer and process
+                buffer.append(readBuffer, bytesRead);
+                size_t consumed = processNatsStream(buffer);
                 version (NatsClientLogging) {
                     if (consumed < buffer.length)
                         logTrace("Fragment (length: %s) left in buffer. Consolidating with another read.", buffer.length - consumed);
                 }
+                // free fully processed messages from the buffer
                 buffer.pop(consumed);
             }
             else if (result == WaitForDataStatus.timeout)
@@ -394,9 +389,9 @@ final class Nats
         char[] cmd;
 
         if (s.queueGroup)
-            cmd = buffer.sformat!"SUB %s %s %s\r\n"(s.subject, s.queueGroup, s.sid);
+            cmd = buffer.sformat!"SUB %s %s %s"(s.subject, s.queueGroup, s.sid);
         else
-            cmd = buffer.sformat!"SUB %s %s\r\n"(s.subject, s.sid);
+            cmd = buffer.sformat!"SUB %s %s"(s.subject, s.sid);
         write(cmd);
     }
 
@@ -406,28 +401,39 @@ final class Nats
     {
         synchronized(_writeMutex)
         {
+            version (NatsClientLogging) logTrace("nats.client write: %s", () @trusted { return cast(string)buffer; }());            
             auto bytesWritten = _conn.write(cast(const(ubyte)[]) buffer, IOMode.all);
-            if (bytesWritten == buffer.length)
+            // nats protocol requires all writes to be separated by CRLF
+            bytesWritten += _conn.write(CRLF, IOMode.all);
+            if (bytesWritten != buffer.length + 2)
             {
-                version (NatsClientLogging) logTrace("nats.client: Write ok. %s bytes written.", bytesWritten);
+                logError("nats.client: Error writing to Nats connection!");
+                throw new NatsProtocolException("Socket write error. Failed msg: %s",
+                    () @trusted { return cast(string)buffer; }());
             }
-            else 
-                logError("nats.client: Error writing to Nats connection, status: %s", bytesWritten);
             _bytesSent += bytesWritten;
         }
     }
 
 
-    size_t processNatsStream(scope const(ubyte)[] response) @safe
+    size_t processNatsStream(ref Nbuff natsResponse) @safe
     {
+        import std.algorithm.comparison: min;
+
         size_t consumed = 0;
         Subscription subscription;
     
-        while(consumed < response.length)
+        while(consumed < natsResponse.length)
         {
             Msg msg;
-            consumed += parseNats(response[consumed..$], msg);
-            version (NatsClientLogging) logTrace("Remaining NATS stream length: %s", response.length - consumed);
+            Nbuff msgPayload;
+
+            if (consumed > 0)
+                natsResponse.pop(consumed);
+            version (NatsClientLogging) 
+                logTrace("Remaining NATS response stream length: %s", natsResponse.length);
+            auto responseData = () @trusted { return natsResponse.data().data(); }();
+            consumed = parseNats(responseData, msg);
 
             final switch (msg.type)
             {	
@@ -436,23 +442,25 @@ final class Nats
 
                 case NatsResponse.MSG:
                 case NatsResponse.MSG_REPLY:
-                    immutable payloadRead = msg.payload.length;
-                    if (msg.length > payloadRead)
+                    immutable alreadyRead = min(msg.length, natsResponse.length - consumed);
+                    msgPayload = natsResponse[consumed .. consumed + alreadyRead];
+                    consumed += alreadyRead;
+                    if (msg.length > alreadyRead)
                     {
-                        assert(response.length == consumed);
-                        version (NatsClientLgging) 
+                        version (NatsClientLogging) 
                             logTrace("MSG payload exceeds initial buffer (length: %s).", msg.length);
-                        auto gcPayload = new ubyte[msg.length];
-                        gcPayload[0..payloadRead] = msg.payload[];
-                        immutable bytesRead = _conn.read(gcPayload[payloadRead..$], IOMode.all);
-                        if (bytesRead < msg.length - payloadRead)
+                        auto msgPayloadBuffer = Nbuff.get(msg.length - alreadyRead);
+                        auto remainingPayload = () @trusted { return msgPayloadBuffer.data(); }();
+                        immutable bytesRead = _conn.read(remainingPayload, IOMode.all);
+                        if (bytesRead < msg.length - alreadyRead)
                         {
-                            logError("nats.client: Message payload incomplete! (expected: %s)", msg.length + 2);
+                            logError("nats.client: Message payload incomplete! (expected: %s bytes)", msg.length);
                             throw new NatsProtocolException("Protocol error while expecting MSG payload.");
                         }
+                        msgPayload.append(msgPayloadBuffer, bytesRead);
                         _bytesReceived += bytesRead;
-                        msg.payload = cast(const) gcPayload;
                     }
+                    msg.payload = () @trusted { return msgPayload.data().data(); }();
                     _msgRecv++;
                     subscription = _subs[msg.sid];
                     subscription.msgsReceived++;
@@ -497,20 +505,11 @@ final class Nats
         return consumed;		
     }
 
-    void processServerInfo(scope Msg msg) @trusted
+    void processServerInfo(scope Msg msg) @safe
     {
         import vibe.data.json: parseJsonString;
 
         _info = parseJsonString(msg.payloadAsString);
-        auto maxPayload = _info["max_payload"].get!uint;
-        if (maxPayload != _largePayloadBuffer.length)
-        {
-            if (_largePayloadBuffer)
-                Mallocator.instance.deallocate(_largePayloadBuffer);
-            version (NatsClientLogging) 
-                logDebug("Allocating _largePayloadBuffer for max %s bytes.", maxPayload);
-            _largePayloadBuffer = cast(ubyte[]) Mallocator.instance.allocate(maxPayload);
-        }
     }
 
     void inboxHandler(scope Msg msg) @safe
