@@ -8,18 +8,6 @@ import std.exception;
 public import nats.interface_;
 import nats.parser;
 
-/* TODO:
- |*| Implement SUB api
- |*| Implement PUB api
- |*| Implement flush logic
- |*| Implement request-response subscriptions
- |*| Support proper connect options
- |*| Support reconnect logic
- |*| Support large messages
- |*| Support distributed queues (subscriber groups)
- | | ? Support (de)serialisation protocols: msgpack, cerealed, none (passthru ubyte[])
-*/
-
 enum VERSION = "nats_v0.3.2";
 
 // Allow quietening the debug logging from nats client
