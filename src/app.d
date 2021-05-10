@@ -1,29 +1,32 @@
 import vibe.core.core;
 import vibe.core.log;
+import core.time; 
 
 import nats.client;
+
+Nats natsConn;
 
 void main(string[] args)
 {
     import std.functional: toDelegate;
 
-    auto nats = new Nats("nats://127.0.0.1:4222", "nats:testClient");
+    natsConn = new Nats("nats://127.0.0.1:4222", "nats:testClient");
 
     logInfo("Starting Nats client version: %s", Nats.natsClientVersion);
-    nats.connect();
+    natsConn.connect();
 
     runTask({
-                import core.time; 
-
                 sleep(50.msecs);
-                nats.subscribe(">", toDelegate(&sub_all_handler));
+                natsConn.subscribe(">", toDelegate(&sub_all_handler));
                 logInfo("Sent subscribe all.");
-                auto greets = nats.subscribe("greetings", toDelegate(&greetings_handler));
-                nats.publish("back_channel", cast(ubyte[])"This came on the back channel...");
-                nats.publish("greetings", cast(ubyte[])"Hello to all greetings subscribers!");		
+                auto greets = natsConn.subscribe("greetings", toDelegate(&greetings_handler));
+                auto responder = natsConn.subscribe("MoL", toDelegate(&responder));
+                natsConn.publish("back_channel", cast(ubyte[])"This came on the back channel...");
+                natsConn.publish("greetings", cast(ubyte[])"Hello to all greetings subscribers!");		
                 sleep(50.msecs);
-                nats.unsubscribe(greets);
-                nats.publish("greetings", cast(ubyte[])"Still there?");
+                natsConn.unsubscribe(greets);
+                natsConn.publishRequest("MoL", cast(ubyte[])"What is the meaning of life?", toDelegate(&response_handler));
+                natsConn.publish("greetings", cast(ubyte[])"Still there?");
             });
 
     runApplication();
@@ -40,3 +43,20 @@ void greetings_handler(scope Msg msg) @safe
     logInfo("greetings_handler--> %s", msg.payloadAsString);
 }
 
+void responder(scope Msg msg) @safe
+{
+    import std.string: representation;
+    import std.exception: assumeUnique;
+
+    logInfo("responder--> starting long calc...");  
+    sleep(1.seconds);   // note: this currently blocks the listener task
+    logInfo("responder--> done. Sending reponse to %s", msg.replySubject);
+    auto replySubject = () @trusted { return msg.replySubject.assumeUnique; }();
+    natsConn.publish(replySubject, "The answer is 42!".representation);
+}
+
+void response_handler(scope Msg msg) @safe
+{
+    logInfo("response_handler--> Got the request response on %s, message: %s", 
+        msg.subject, msg.payloadAsString);
+}

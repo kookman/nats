@@ -12,7 +12,7 @@ import nats.parser;
  |*| Implement SUB api
  |*| Implement PUB api
  |*| Implement flush logic
- | | Implement request-response subscriptions
+ |*| Implement request-response subscriptions
  |*| Support proper connect options
  |*| Support reconnect logic
  |*| Support large messages
@@ -28,7 +28,6 @@ else version = NatsClientLogging;
 
 final class Nats
 {
-    import std.experimental.allocator.mallocator: Mallocator;
     import std.format: sformat;
     import std.socket: Address, parseAddress;
     import std.traits: Unqual;
@@ -191,19 +190,19 @@ final class Nats
     }
 
 
-    void publish(scope string subject, scope const ubyte[] payload) @safe
+    void publish(scope string subject, scope const(ubyte)[] payload) @safe
     {
-        char[OUTCMD_BUFSIZE] buffer = void;
-        char[] cmd;
-    
-        cmd = buffer.sformat!"PUB %s %s"(subject, payload.length);
-        // ensure we don't interleave other writes between writing PUB command & payload
-        synchronized(_writeMutex)
-        {
-            write(cmd);
-            write(payload);
-            _msgSent++;
-        }
+        sendPublish(subject, payload);
+    }
+
+
+    void publishRequest(scope string subject, scope const(ubyte)[] payload, NatsHandler handler) @safe
+    {
+        import std.conv: to;
+        auto inboxId = to!string(_msgSent);
+        _inboxes[inboxId] = handler;
+        auto replyInbox = _inboxPrefix ~ inboxId;
+        sendPublish(subject, payload, replyInbox);
     }
 
 
@@ -257,6 +256,8 @@ final class Nats
     ushort               _port;
     bool 				 _useTls;
     NatsState			 _connState;
+    string               _inboxPrefix;
+    NatsHandler[string]  _inboxes;
 
 
     void connector() @safe
@@ -291,8 +292,9 @@ final class Nats
                 auto rtt = flush();
                 version (NatsClientLogging) logDebug("Connector: Flush roundtrip (%s) completed. Nats connection ready.", rtt);
                 // create a connection specific inbox subscription
+                _inboxPrefix = "_INBOX_" ~ _conn.localAddress.toString() ~ "_.";
                 auto inbox = new Subscription;
-                inbox.subject = "_INBOX_" ~ _conn.localAddress.toString();
+                inbox.subject = _inboxPrefix ~ "*";
                 inbox.sid = 0;
                 inbox.handler = &inboxHandler;
                 //_subs[0] is always my _INBOX_ so just replace any existing one
@@ -380,6 +382,22 @@ final class Nats
             }
         }
         logWarn("nats.client: Nats session disconnected! Heartbeater task terminating.");
+    }
+
+
+    void sendPublish(scope string subject, scope const(ubyte)[] payload, scope string replySubject = null) @safe
+    {
+        char[OUTCMD_BUFSIZE] buffer = void;
+        char[] cmd;
+    
+        cmd = buffer.sformat!"PUB %s %s %s"(subject, replySubject, payload.length);
+        // ensure we don't interleave other writes between writing PUB command & payload
+        synchronized(_writeMutex)
+        {
+            write(cmd);
+            write(payload);
+            _msgSent++;
+        }
     }
 
 
@@ -514,7 +532,23 @@ final class Nats
 
     void inboxHandler(scope Msg msg) @safe
     {
+        import std.algorithm.searching: findSplitAfter;
+        
         version (NatsClientLogging) 
             logDebugV("Inbox %s handler called with msg: %s", msg.subject, msg.payloadAsString);
+        auto inbox = msg.subject.findSplitAfter("_.");
+        if (!inbox) {
+            logWarn("nats.client: Discarding unexpected response in inbox: %s", msg.subject);
+            return;
+        }
+        auto p_handler = (inbox[1] in _inboxes);
+        if (p_handler !is null) {
+            (*p_handler)(msg);
+        }
+        else {
+            logWarn("nats.client: No response handler for response in inbox: %s. Response discarded.", 
+                msg.subject);
+            return;
+        }
     }
 }

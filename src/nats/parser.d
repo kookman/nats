@@ -25,7 +25,7 @@ size_t parseNats(scope const(ubyte)[] response, out Msg msg) @safe
     import std.algorithm.comparison: equal;
     import std.algorithm.searching: findSplitAfter, startsWith;
     import std.algorithm.iteration: splitter;
-    import std.ascii: isAlpha;
+    import std.ascii: isDigit;
     import std.conv: to;
 
     size_t consumed = 0;
@@ -54,7 +54,7 @@ size_t parseNats(scope const(ubyte)[] response, out Msg msg) @safe
         tokens.popFront();
         msg.sid = tokens.front.to!uint;
         tokens.popFront();
-        if (tokens.front[0].isAlpha)
+        if (!tokens.front[0].isDigit)
         {
             msg.type = NatsResponse.MSG_REPLY;
             msg.replySubject = tokens.front;
