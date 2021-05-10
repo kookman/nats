@@ -26,7 +26,9 @@ void main(string[] args)
                 sleep(50.msecs);
                 natsConn.unsubscribe(greets);
                 natsConn.publishRequest("MoL", cast(ubyte[])"What is the meaning of life?", toDelegate(&response_handler));
+                sleep(5000.msecs);
                 natsConn.publish("greetings", cast(ubyte[])"Still there?");
+                natsConn.publishRequest("MoL", cast(ubyte[])"Are you sure its 42?", toDelegate(&response_handler));
             });
 
     runApplication();

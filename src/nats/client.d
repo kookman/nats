@@ -20,7 +20,7 @@ import nats.parser;
  | | ? Support (de)serialisation protocols: msgpack, cerealed, none (passthru ubyte[])
 */
 
-enum VERSION = import("VERSION");
+enum VERSION = "nats_v0.3.2";
 
 // Allow quietening the debug logging from nats client
 version (NatsClientQuiet) {}
@@ -533,17 +533,20 @@ final class Nats
     void inboxHandler(scope Msg msg) @safe
     {
         import std.algorithm.searching: findSplitAfter;
+        import std.exception: assumeUnique;
         
         version (NatsClientLogging) 
             logDebugV("Inbox %s handler called with msg: %s", msg.subject, msg.payloadAsString);
-        auto inbox = msg.subject.findSplitAfter("_.");
-        if (!inbox) {
+        auto findInbox = msg.subject.findSplitAfter("_.");
+        if (!findInbox) {
             logWarn("nats.client: Discarding unexpected response in inbox: %s", msg.subject);
             return;
         }
-        auto p_handler = (inbox[1] in _inboxes);
+        auto inbox = () @trusted { return findInbox[1].assumeUnique; }();
+        auto p_handler = (inbox in _inboxes);
         if (p_handler !is null) {
             (*p_handler)(msg);
+            _inboxes.remove(inbox);
         }
         else {
             logWarn("nats.client: No response handler for response in inbox: %s. Response discarded.", 

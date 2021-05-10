@@ -9,7 +9,6 @@ dependency "vibe-d:inet" version="~>0.9"
 dependency "nbuff" version="~>0.1"
 
 dflags "-preview=dip25" "-preview=dip1000" "-preview=in"
-stringImportPaths "."
 
 configuration "lib" {
     targetType "library"
