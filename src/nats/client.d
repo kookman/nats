@@ -8,7 +8,7 @@ import std.exception;
 public import nats.interface_;
 import nats.parser;
 
-enum VERSION = "nats_v0.3.2";
+enum VERSION = "nats_v0.3.3";
 
 // Allow quietening the debug logging from nats client
 version (NatsClientQuiet) {}
@@ -188,7 +188,7 @@ final class Nats
     {
         import std.conv: to;
         auto inboxId = to!string(_msgSent);
-        _inboxes[inboxId] = handler;
+        _inboxes[_msgSent] = handler;
         auto replyInbox = _inboxPrefix ~ inboxId;
         sendPublish(subject, payload, replyInbox);
     }
@@ -245,7 +245,7 @@ final class Nats
     bool 				 _useTls;
     NatsState			 _connState;
     string               _inboxPrefix;
-    NatsHandler[string]  _inboxes;
+    NatsHandler[uint]    _inboxes;
 
 
     void connector() @safe
@@ -521,7 +521,7 @@ final class Nats
     void inboxHandler(scope Msg msg) @safe
     {
         import std.algorithm.searching: findSplitAfter;
-        import std.exception: assumeUnique;
+        import std.conv: to;
         
         version (NatsClientLogging) 
             logDebugV("Inbox %s handler called with msg: %s", msg.subject, msg.payloadAsString);
@@ -530,7 +530,7 @@ final class Nats
             logWarn("nats.client: Discarding unexpected response in inbox: %s", msg.subject);
             return;
         }
-        auto inbox = () @trusted { return findInbox[1].assumeUnique; }();
+        auto inbox = findInbox[1].to!uint;
         auto p_handler = (inbox in _inboxes);
         if (p_handler !is null) {
             (*p_handler)(msg);
