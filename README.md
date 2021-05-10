@@ -9,15 +9,14 @@ and currently all message processing is handled synchronously, to avoid unnecess
 copying of `Msg` structs on the GC heap.
 
 Current features supported:
-
- |*| Implement SUB api
- |*| Implement PUB api
- |*| Implement flush logic
- |*| Implement request-response subscriptions
- |*| Support proper connect options
- |*| Support reconnect logic
- |*| Support large messages
- |*| Support distributed queues (subscriber groups)
- | | ? Support (de)serialisation protocols: msgpack, cerealed, none (passthru ubyte[])
+- [x] Implement SUB api
+- [x] Implement PUB api
+- [x] Implement flush logic
+- [x] Implement request-response subscriptions
+- [x] Support proper connect options
+- [x] Support reconnect logic
+- [x] Support large messages
+- [x] Support distributed queues (subscriber groups)
+- [ ] ? Support (de)serialisation protocols: msgpack, cerealed, none (passthru ubyte[])
 
 For example usage, see the test app (`src/app.d`).
