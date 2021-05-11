@@ -6,7 +6,8 @@ itself in the "hot loop" (ie normal message receipt and processing).
 
 For this reason, the `NatsHandlers` receive the `Msg` struct as a `scope` parameter,
 and currently all message processing is handled synchronously, to avoid unnecessary
-copying of `Msg` structs on the GC heap.
+copying of `Msg` structs on the GC heap. This also matches with (my) typical deployment
+profile of small, single purpose processes with a single message processing thread. 
 
 Current features supported:
 - [x] Implement SUB api
@@ -17,6 +18,7 @@ Current features supported:
 - [x] Support reconnect logic
 - [x] Support large messages
 - [x] Support distributed queues (subscriber groups)
+- [ ] Support Nats 2.0 Nkey-based authentication (requires libsodium for ed25519 keys)
 - [ ] ? Support (de)serialisation protocols: msgpack, cerealed, none (passthru ubyte[])
 
 For example usage, see the test app (`src/app.d`).
