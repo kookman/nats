@@ -8,7 +8,7 @@ import std.exception;
 public import nats.interface_;
 import nats.parser;
 
-enum VERSION = "nats_v0.3.4";
+enum VERSION = "nats_v0.3.5";
 
 // Allow quietening the debug logging from nats client
 version (NatsClientQuiet) {}
@@ -178,13 +178,15 @@ final class Nats
     }
 
 
-    void publish(scope string subject, scope const(ubyte)[] payload) @safe
-    {
+    void publish(T)(scope const(char)[] subject, scope const(T)[] payload) @safe
+        if (is(Unqual!T == ubyte) || is(Unqual!T == char))
+   {
         sendPublish(subject, payload);
     }
 
 
-    void publishRequest(scope string subject, scope const(ubyte)[] payload, NatsHandler handler) @safe
+    void publishRequest(T)(scope const(char)[] subject, scope const(T)[] payload, NatsHandler handler) @safe
+        if (is(Unqual!T == ubyte) || is(Unqual!T == char))
     {
         import std.conv: to;
         auto inboxId = to!string(_msgSent);
@@ -373,7 +375,8 @@ final class Nats
     }
 
 
-    void sendPublish(scope string subject, scope const(ubyte)[] payload, scope string replySubject = null) @safe
+    void sendPublish(T)(scope const(char)[] subject, scope const(T)[] payload, scope const(char)[] replySubject = null) @safe
+        if (is(Unqual!T == ubyte) || is(Unqual!T == char))
     {
         char[OUTCMD_BUFSIZE] buffer = void;
         char[] cmd;
