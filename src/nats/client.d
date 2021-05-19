@@ -8,7 +8,7 @@ import std.exception;
 public import nats.interface_;
 import nats.parser;
 
-enum VERSION = "nats_v0.3.3";
+enum VERSION = "nats_v0.3.4";
 
 // Allow quietening the debug logging from nats client
 version (NatsClientQuiet) {}
@@ -429,6 +429,7 @@ final class Nats
         size_t consumed = 0;
         Subscription subscription;
     
+        loop:
         while(consumed < natsResponse.length)
         {
             Msg msg;
@@ -436,36 +437,40 @@ final class Nats
 
             if (consumed > 0)
                 natsResponse.pop(consumed);
-            version (NatsClientLogging) 
-                logTrace("Remaining NATS response stream length: %s", natsResponse.length);
             auto responseData = () @trusted { return natsResponse.data().data(); }();
+            version (NatsClientLogging)
+                logTrace("Sending response slice length %d to parseNats.", responseData.length);
             consumed = parseNats(responseData, msg);
 
             final switch (msg.type)
             {	
                 case NatsResponse.FRAGMENT:
-                    break;
-
+                    if (consumed > 0) {
+                        break;
+                    } else {
+                        break loop;
+                    }
+                        
                 case NatsResponse.MSG:
                 case NatsResponse.MSG_REPLY:
                     immutable alreadyRead = min(msg.length, natsResponse.length - consumed);
-                    msgPayload = natsResponse[consumed .. consumed + alreadyRead];
-                    consumed += alreadyRead;
                     if (msg.length > alreadyRead)
                     {
                         version (NatsClientLogging) 
                             logTrace("MSG payload exceeds initial buffer (length: %s).", msg.length);
                         auto msgPayloadBuffer = Nbuff.get(msg.length - alreadyRead);
                         auto remainingPayload = () @trusted { return msgPayloadBuffer.data(); }();
-                        immutable bytesRead = _conn.read(remainingPayload, IOMode.all);
+                        immutable bytesRead = _conn.read(remainingPayload[0 .. msg.length - alreadyRead], IOMode.all);
                         if (bytesRead < msg.length - alreadyRead)
                         {
                             logError("nats.client: Message payload incomplete! (expected: %s bytes)", msg.length);
                             throw new NatsProtocolException("Protocol error while expecting MSG payload.");
                         }
-                        msgPayload.append(msgPayloadBuffer, bytesRead);
+                        natsResponse.append(msgPayloadBuffer, bytesRead);
                         _bytesReceived += bytesRead;
                     }
+                    msgPayload = natsResponse[consumed .. consumed + msg.length];
+                    consumed += msg.length;
                     msg.payload = () @trusted { return msgPayload.data().data(); }();
                     _msgRecv++;
                     subscription = _subs[msg.sid];
@@ -480,32 +485,32 @@ final class Nats
                         // note: this is a synchronous callback - don't block the event loop for too long
                         // if necessary, copy what is needed out of the msg and send to a new Task or Thread
                         subscription.handler(msg);
-                    continue;
+                    continue loop;
                 
                 case NatsResponse.PING:
                     write(PONG);
                     _pongSent++;
                     version (NatsClientLogging) logDebugV("Pong sent.");
-                    continue;
+                    continue loop;
                 
                 case NatsResponse.PONG:
                     _pongRecv++;
                     if (_pongRecv == _pingSent) 
                         _flushSync.emit();
-                    continue;
+                    continue loop;
 
                 case NatsResponse.OK:
                     version (NatsClientLogging) logDebug("Ok received.");
-                    continue;
+                    continue loop;
 
                 case NatsResponse.INFO:
                     version (NatsClientLogging) logDebug("Server INFO msg: %s", msg.payloadAsString);
                     processServerInfo(msg);
-                    continue;
+                    continue loop;
 
                 case NatsResponse.ERR:
                     logError("nats.client: Server ERR msg: %s", msg.payloadAsString);
-                    continue;
+                    continue loop;
             }
         }
         return consumed;		
