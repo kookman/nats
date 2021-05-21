@@ -8,7 +8,7 @@ import std.exception;
 public import nats.interface_;
 import nats.parser;
 
-enum VERSION = "nats_v0.3.5";
+enum VERSION = "nats_v0.3.6";
 
 // Allow quietening the debug logging from nats client
 version (NatsClientQuiet) {}
@@ -91,7 +91,6 @@ final class Nats
 
         _flushMutex = new TaskMutex;
         _writeMutex = new RecursiveTaskMutex;
-        _readIdle = createManualEvent();
         _flushSync = createManualEvent();
         // reserve a sensible minimum amount of space for new subscriptions
         _subs.reserve(16);
@@ -200,19 +199,21 @@ final class Nats
     {
         synchronized(_flushMutex)
         {
-            _lastFlush = MonoTime.currTime();
+            auto start = MonoTime.currTime();
             auto syncEvents = _flushSync.emitCount();
             write(PING);
             _pingSent++;
             _flushSync.wait(timeout, syncEvents);
-            if (_flushSync.emitCount() == syncEvents)
-            {
-                logError("nats.client: Flush timeout. Disconnected?");
-                if (!connected())
-                    _connState = NatsState.DISCONNECTED;
+            if (_flushSync.emitCount() == syncEvents) {
+                logError("nats.client: Flush timeout. Disconnecting.");
+                _conn.close();  
+                _connState = NatsState.DISCONNECTED;
+                _lastFlushRTT = Duration.init;
+            } else {
+                _lastFlushRTT = MonoTime.currTime() - start;
             }
         }
-        return MonoTime.currTime() - _lastFlush;
+        return _lastFlushRTT;
     }
 
 
@@ -223,9 +224,8 @@ final class Nats
     TCPConnection 		 _conn;
     RecursiveTaskMutex	 _writeMutex;
     TaskMutex 			 _flushMutex;
-    LocalManualEvent	 _readIdle;
     LocalManualEvent	 _flushSync;
-    MonoTime 			 _lastFlush;
+    Duration 			 _lastFlushRTT;
     Duration			 _heartbeatInterval;
     Duration             _reconnectInterval;
     Duration             _connectTimeout;
@@ -324,7 +324,9 @@ final class Nats
 
         while(connected())
         {
-            auto result = _conn.waitForDataEx(_heartbeatInterval);
+            // task blocks here until we receive data. No timeout as that is handled
+            // by the heartbeater task.
+            auto result = _conn.waitForDataEx();
             if (result == WaitForDataStatus.dataAvailable)
             {
                 auto readBuffer = Nbuff.get(readSize);
@@ -341,17 +343,14 @@ final class Nats
                 // free fully processed messages from the buffer
                 buffer.pop(consumed);
             }
-            else if (result == WaitForDataStatus.timeout)
-            {
-                version (NatsClientLogging) logDebugV("nats.client Listener idle: Notifying heartbeater.");
-                _readIdle.emit();
-            }
             else if (result == WaitForDataStatus.noMoreData)
             {
                 logError("nats.client: Listener read session closed unexpectedly: %s", result);
-                // ensure underlying TCP connection is closed - state might not yet reflect this
-                _conn.close();  
-                _connState = NatsState.DISCONNECTED;
+                if (connected()) {
+                    // ensure underlying TCP connection is closed - state might not yet reflect this
+                    _conn.close();  
+                    _connState = NatsState.DISCONNECTED;
+                }
             }
         }
         logWarn("nats.client: Nats session disconnected! Listener task terminating. Connector will attempt reconnect.");
@@ -363,12 +362,16 @@ final class Nats
         version (NatsClientLogging) logDebug("nats.client: heartbeater task started.");
         while(connected())
         {
-            auto idleCount = _readIdle.emitCount();
-            _readIdle.wait(_heartbeatInterval, idleCount);
-            if (MonoTime.currTime() - _lastFlush > _heartbeatInterval)
+            auto prevSent = _msgSent;
+            auto prevRecv = _msgRecv;
+            auto prevPing = _pingRecv;
+            sleep(_heartbeatInterval);
+            if (_msgSent == prevSent && _msgRecv == prevRecv && _pingRecv == prevPing)
             {
+                version (NatsClientLogging) logDebugV("nats.client: Nats connection idle for %s. Sending heartbeat.",
+                    _heartbeatInterval);
                 auto rtt = flush();
-                version (NatsClientLogging) logDebugV("Nats Heartbeat RTT: %s", rtt);
+                version (NatsClientLogging) logDebugV("nats.client: Nats Heartbeat RTT: %s", rtt);
             }
         }
         logWarn("nats.client: Nats session disconnected! Heartbeater task terminating.");

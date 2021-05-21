@@ -63,7 +63,7 @@ void query_responder(scope Msg msg) @safe
     void responder(string reply, int data, Nats conn)
     {
         char[80] buffer;
-        int delay = uniform(0, 1000);
+        int delay = uniform(0, 10);
         logInfo("responder %d --> starting %d ms long calc...", data, delay);  
         sleep(delay.msecs); 
         logInfo("responder %d --> done. Sending reponse to %s", data, reply);

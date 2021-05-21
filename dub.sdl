@@ -19,6 +19,7 @@ configuration "build-deps" {
 }
 configuration "test-app" {
     targetType "executable"
+    targetName "testapp"
 }
 configuration "unittest" {
     excludedSourceFiles "src/app.d"
