@@ -38,18 +38,18 @@ void main(string[] args)
     runApplication();
 }
 
-void shutdown_handler(scope Msg msg) @safe
+void shutdown_handler(scope Msg msg) @safe nothrow
 {
     logInfo("Shutdown msg received. Shutting down.");
     exitEventLoop();
 }
 
-void sub_all_handler(scope Msg msg) @safe
+void sub_all_handler(scope Msg msg) @safe nothrow
 {
     logInfo("sub_all_handler--> msg subject: %s, msg payload: %s", msg.subject, msg.payloadAsString);
 }
 
-void greetings_handler(scope Msg msg) @safe
+void greetings_handler(scope Msg msg) @safe nothrow
 {
     logInfo("greetings_handler--> %s", msg.payloadAsString);
 }
@@ -77,7 +77,7 @@ void query_responder(scope Msg msg) @safe
     runTask(&responder, replySubject, id, natsConn);
 }
 
-void response_handler(scope Msg msg) @safe
+void response_handler(scope Msg msg) @safe nothrow
 {
     logInfo("response_handler--> Got the request response on %s, message: %s", 
         msg.subject, msg.payloadAsString);

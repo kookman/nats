@@ -8,7 +8,7 @@ import std.exception;
 public import nats.interface_;
 import nats.parser;
 
-enum VERSION = "nats_v0.3.6";
+enum VERSION = "nats_v0.3.7";
 
 // Allow quietening the debug logging from nats client
 version (NatsClientQuiet) {}
@@ -21,8 +21,7 @@ final class Nats
     import std.traits: Unqual;
     import eventcore.core: IOMode;
     import vibe.core.net: TCPConnection, connectTCP, WaitForDataStatus;
-    import vibe.core.sync: LocalManualEvent, RecursiveTaskMutex, TaskMutex,
-            createManualEvent;
+    import vibe.core.sync: TaskCondition, RecursiveTaskMutex, TaskMutex;
     import vibe.data.json: Json;
     import nbuff: Nbuff;
 
@@ -91,7 +90,7 @@ final class Nats
 
         _flushMutex = new TaskMutex;
         _writeMutex = new RecursiveTaskMutex;
-        _flushSync = createManualEvent();
+        _flushSync = new TaskCondition(_flushMutex);
         // reserve a sensible minimum amount of space for new subscriptions
         _subs.reserve(16);
     }
@@ -200,18 +199,10 @@ final class Nats
         synchronized(_flushMutex)
         {
             auto start = MonoTime.currTime();
-            auto syncEvents = _flushSync.emitCount();
             write(PING);
             _pingSent++;
-            _flushSync.wait(timeout, syncEvents);
-            if (_flushSync.emitCount() == syncEvents) {
-                logError("nats.client: Flush timeout. Disconnecting.");
-                _conn.close();  
-                _connState = NatsState.DISCONNECTED;
-                _lastFlushRTT = Duration.init;
-            } else {
-                _lastFlushRTT = MonoTime.currTime() - start;
-            }
+            _flushSync.wait();
+            _lastFlushRTT = MonoTime.currTime() - start;
         }
         return _lastFlushRTT;
     }
@@ -224,7 +215,7 @@ final class Nats
     TCPConnection 		 _conn;
     RecursiveTaskMutex	 _writeMutex;
     TaskMutex 			 _flushMutex;
-    LocalManualEvent	 _flushSync;
+    TaskCondition   	 _flushSync;
     Duration 			 _lastFlushRTT;
     Duration			 _heartbeatInterval;
     Duration             _reconnectInterval;
@@ -360,18 +351,31 @@ final class Nats
     void heartbeater() @safe
     {
         version (NatsClientLogging) logDebug("nats.client: heartbeater task started.");
+
+        auto timer = createTimer(null);
         while(connected())
         {
             auto prevSent = _msgSent;
             auto prevRecv = _msgRecv;
             auto prevPing = _pingRecv;
-            sleep(_heartbeatInterval);
-            if (_msgSent == prevSent && _msgRecv == prevRecv && _pingRecv == prevPing)
-            {
+            bool flushPending = false;
+            timer.rearm(_heartbeatInterval, false);
+            timer.wait();
+            //sleep(_heartbeatInterval);
+            if (!flushPending && _msgSent == prevSent && _msgRecv == prevRecv && _pingRecv == prevPing && connected()) {
                 version (NatsClientLogging) logDebugV("nats.client: Nats connection idle for %s. Sending heartbeat.",
                     _heartbeatInterval);
-                auto rtt = flush();
-                version (NatsClientLogging) logDebugV("nats.client: Nats Heartbeat RTT: %s", rtt);
+                runTask({
+                    flushPending = true;
+                    auto rtt = flush();
+                    version (NatsClientLogging) logDebugV("nats.client: Nats Heartbeat RTT: %s", rtt);
+                    flushPending = false;
+                });
+            } else if (flushPending) {
+                logError("nats.client: Heartbeat did not return within heartbeat interval (%s).", _heartbeatInterval);
+                _conn.close();
+                _connState = NatsState.DISCONNECTED;
+                break;
             }
         }
         logWarn("nats.client: Nats session disconnected! Heartbeater task terminating.");
@@ -408,7 +412,7 @@ final class Nats
     }
 
 
-    void write(T)(scope inout T[] buffer) @safe
+    void write(T)(scope const(T)[] buffer) @safe 
         if (is(Unqual!T == ubyte) || is(Unqual!T == char))
     {
         synchronized(_writeMutex)
@@ -419,9 +423,7 @@ final class Nats
             bytesWritten += _conn.write(CRLF, IOMode.all);
             if (bytesWritten != buffer.length + 2)
             {
-                logError("nats.client: Error writing to Nats connection!");
-                throw new NatsProtocolException("Socket write error. Failed msg: %s",
-                    () @trusted { return cast(string)buffer; }());
+                logError("nats.client: Error writing to Nats connection! Socket write error.");
             }
             _bytesSent += bytesWritten;
         }
@@ -470,7 +472,6 @@ final class Nats
                         if (bytesRead < msg.length - alreadyRead)
                         {
                             logError("nats.client: Message payload incomplete! (expected: %s bytes)", msg.length);
-                            throw new NatsProtocolException("Protocol error while expecting MSG payload.");
                         }
                         natsResponse.append(msgPayloadBuffer, bytesRead);
                         _bytesReceived += bytesRead;
@@ -485,7 +486,8 @@ final class Nats
                     if (subscription.msgsReceived > subscription.msgsToExpire)
                         subscription.closed = true;
                     if (subscription.closed)
-                        logWarn("nats.client: Message received on closed subscription! (msg.subject: %s, subscription: %s)", msg.subject, subscription.subject);
+                        logWarn("nats.client: Message received on closed subscription! (msg.subject: %s, subscription: %s)", 
+                            msg.subject, subscription.subject);
                     else
                         // now call the message handler
                         // note: this is a synchronous callback - don't block the event loop for too long
@@ -502,7 +504,7 @@ final class Nats
                 case NatsResponse.PONG:
                     _pongRecv++;
                     if (_pongRecv == _pingSent) 
-                        _flushSync.emit();
+                        _flushSync.notify();
                     continue loop;
 
                 case NatsResponse.OK:
