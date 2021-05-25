@@ -436,11 +436,11 @@ final class Nats
         char[] cmd;
 
         try {
-            write(cmd);
             if (s.queueGroup)
                 cmd = buffer.sformat!"SUB %s %s %s"(s.subject, s.queueGroup, s.sid);
             else
                 cmd = buffer.sformat!"SUB %s %s"(s.subject, s.sid);
+            write(cmd);
         }
         catch (Exception e) {
             logError("nats.client: Error (%s) subscribing on (%s). Disconnecting from Nats.", e.msg, s.subject);
