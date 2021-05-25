@@ -22,7 +22,7 @@ Current features supported:
 - [x] Support reconnect logic
 - [x] Support large messages
 - [x] Support distributed queues (subscriber groups)
-- [ ] Disconnect/clean shutdown
+- [x] Disconnect/clean shutdown
 - [ ] Support Nats 2.0 Nkey-based authentication (requires libsodium for ed25519 keys)
 - [ ] ? Support (de)serialisation protocols: msgpack, cerealed, none (passthru ubyte[])
 

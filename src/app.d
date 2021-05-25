@@ -13,6 +13,7 @@ void main(string[] args)
 {
     import std.functional: toDelegate;
 
+    setLogFormat(FileLogger.Format.threadTime, FileLogger.Format.threadTime);
     natsConn = new Nats("nats://127.0.0.1:4222", "nats:testClient");
 
     logInfo("Starting Nats client version: %s", Nats.natsClientVersion);
@@ -54,7 +55,7 @@ void greetings_handler(scope Msg msg) @safe nothrow
     logInfo("greetings_handler--> %s", msg.payloadAsString);
 }
 
-void query_responder(scope Msg msg) @safe
+void query_responder(scope Msg msg) @safe nothrow
 {
     import std.conv: to;
     import std.format: sformat;
@@ -63,7 +64,7 @@ void query_responder(scope Msg msg) @safe
     void responder(string reply, int data, Nats conn)
     {
         char[80] buffer;
-        int delay = uniform(0, 10);
+        int delay = uniform(0, 200);
         logInfo("responder %d --> starting %d ms long calc...", data, delay);  
         sleep(delay.msecs); 
         logInfo("responder %d --> done. Sending reponse to %s", data, reply);
@@ -73,8 +74,13 @@ void query_responder(scope Msg msg) @safe
     // note: we runTask to avoid blocking the listener task
     // so we must extract the msg contents we need (since it is scoped)
     auto replySubject = msg.replySubject.idup;
-    int id = to!int(msg.payloadAsString);
-    runTask(&responder, replySubject, id, natsConn);
+    try {
+        int id = to!int(msg.payloadAsString);
+        runTask(&responder, replySubject, id, natsConn);
+    }
+    catch (Exception e) {
+        logWarn("Failed to deserialize request message: (%s)", msg.payloadAsString);
+    }
 }
 
 void response_handler(scope Msg msg) @safe nothrow

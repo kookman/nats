@@ -21,7 +21,16 @@ struct Msg
     }
 }
 
-alias NatsHandler = void delegate(scope Msg) @safe;
+/*
+NatsHandlers run in the eventloop thread and block the listener task while they process
+(the message stream is ordered). This leads to two constraints:
+  1. Msg is scope parameter to avoid unnecessary copying/allocation
+  2. Delegate must be nothrow to avoid killing the listener task with unhandled exception
+
+If you need to do more processing, it is better to copy the information you need from the
+Msg struct and send to a task or worker task (ie in a different thread)
+*/ 
+alias NatsHandler = void delegate(scope Msg) @safe nothrow;
 
 class Subscription
 {

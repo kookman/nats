@@ -8,7 +8,7 @@ import std.exception;
 public import nats.interface_;
 import nats.parser;
 
-enum VERSION = "nats_v0.3.7";
+enum VERSION = "nats_v0.4.0";
 
 // Allow quietening the debug logging from nats client
 version (NatsClientQuiet) {}
@@ -88,6 +88,7 @@ final class Nats
         _reconnectInterval = config.reconnectInterval;
         _connectTimeout = config.connectTimeout;
 
+        _connectMutex = new TaskMutex;
         _flushMutex = new TaskMutex;
         _writeMutex = new RecursiveTaskMutex;
         _flushSync = new TaskCondition(_flushMutex);
@@ -113,7 +114,7 @@ final class Nats
 
     void connect() @safe
     {
-        runTask(&connector);
+        _connector = runTask(&connector);
     }
 
 
@@ -123,13 +124,13 @@ final class Nats
     }
 
 
-    const(Subscription[]) subscriptions() @safe const
+    const(Subscription[]) subscriptions() @safe const nothrow
     {
         return _subs;
     }
 
 
-    const(Statistics) statistics() @safe const
+    const(Statistics) statistics() @safe const nothrow
     {
         Statistics stats;
 
@@ -176,14 +177,14 @@ final class Nats
     }
 
 
-    void publish(T)(scope const(char)[] subject, scope const(T)[] payload) @safe
+    void publish(T)(scope const(char)[] subject, scope const(T)[] payload) @safe nothrow
         if (is(Unqual!T == ubyte) || is(Unqual!T == char))
    {
         sendPublish(subject, payload);
     }
 
 
-    void publishRequest(T)(scope const(char)[] subject, scope const(T)[] payload, NatsHandler handler) @safe
+    void publishRequest(T)(scope const(char)[] subject, scope const(T)[] payload, NatsHandler handler) @safe nothrow
         if (is(Unqual!T == ubyte) || is(Unqual!T == char))
     {
         import std.conv: to;
@@ -194,19 +195,39 @@ final class Nats
     }
 
 
-    Duration flush(Duration timeout = 5.seconds) @safe
+    Duration flush(Duration timeout = 5.seconds) @safe nothrow
     {
-        synchronized(_flushMutex)
-        {
-            auto start = MonoTime.currTime();
+        _flushMutex.lock();
+        scope(exit) _flushMutex.unlock();
+        
+        auto start = MonoTime.currTime();
+        try 
             write(PING);
-            _pingSent++;
-            _flushSync.wait();
-            _lastFlushRTT = MonoTime.currTime() - start;
+        catch (Exception e) {
+            logError("nats.client: Flush write error (%s). Disconnecting from Nats.", e.msg);
+            disconnect();
         }
+        _pingSent++;
+        _flushSync.wait();
+        _lastFlushRTT = MonoTime.currTime() - start;
         return _lastFlushRTT;
     }
 
+    void disconnect() @safe nothrow
+    {
+        _connectMutex.lock();
+        scope(exit) _connectMutex.unlock();
+        
+        if (_connState != NatsState.CLOSED) {
+            logInfo("nats.client: Closing TCP connection to Nats server.");
+            try 
+                _conn.close();
+            catch (Exception e) {
+                logError("nats client: Error (%s) closing TCP connection!");
+            }
+            _connState = NatsState.CLOSED;
+        }
+    }
 
     private:
 
@@ -214,12 +235,14 @@ final class Nats
 
     TCPConnection 		 _conn;
     RecursiveTaskMutex	 _writeMutex;
+    TaskMutex            _connectMutex;
     TaskMutex 			 _flushMutex;
     TaskCondition   	 _flushSync;
     Duration 			 _lastFlushRTT;
     Duration			 _heartbeatInterval;
     Duration             _reconnectInterval;
     Duration             _connectTimeout;
+    Task                 _connector;
     Task                 _heartbeater;
     Task                 _listener;
     ulong                _bytesSent;
@@ -248,8 +271,11 @@ final class Nats
         char[OUTCMD_BUFSIZE] buffer = void;
         char[] cmd;
 
-        while (_connState != NatsState.CLOSED)
+        while (!connected() && _connState != NatsState.CLOSED)
         {
+            _connectMutex.lock();
+            scope(exit) _connectMutex.unlock();
+
             auto initialState = _connState;
             version (NatsClientLogging) logDebug("Connector: Establishing connection to NATS server (%s) port %s ...", _host, _port);
             try
@@ -382,33 +408,44 @@ final class Nats
     }
 
 
-    void sendPublish(T)(scope const(char)[] subject, scope const(T)[] payload, scope const(char)[] replySubject = null) @safe
+    void sendPublish(T)(scope const(char)[] subject, scope const(T)[] payload, scope const(char)[] replySubject = null) @safe nothrow
         if (is(Unqual!T == ubyte) || is(Unqual!T == char))
     {
         char[OUTCMD_BUFSIZE] buffer = void;
         char[] cmd;
     
-        cmd = buffer.sformat!"PUB %s %s %s"(subject, replySubject, payload.length);
-        // ensure we don't interleave other writes between writing PUB command & payload
-        synchronized(_writeMutex)
-        {
+        try {
+            cmd = buffer.sformat!"PUB %s %s %s"(subject, replySubject, payload.length);
+            // ensure we don't interleave other writes between writing PUB command & payload
+            _writeMutex.lock();
+            scope(exit) _writeMutex.unlock();       
             write(cmd);
             write(payload);
             _msgSent++;
         }
+        catch (Exception e) {
+            logError("nats.client: Publish failed (%s), command (%s). Disconnecting from Nats.", e.msg, cmd);
+            disconnect();
+        }
     }
 
 
-    void sendSubscribe(Subscription s) @safe
+    void sendSubscribe(Subscription s) @safe nothrow
     {
         char[OUTCMD_BUFSIZE] buffer = void;
         char[] cmd;
 
-        if (s.queueGroup)
-            cmd = buffer.sformat!"SUB %s %s %s"(s.subject, s.queueGroup, s.sid);
-        else
-            cmd = buffer.sformat!"SUB %s %s"(s.subject, s.sid);
-        write(cmd);
+        try {
+            write(cmd);
+            if (s.queueGroup)
+                cmd = buffer.sformat!"SUB %s %s %s"(s.subject, s.queueGroup, s.sid);
+            else
+                cmd = buffer.sformat!"SUB %s %s"(s.subject, s.sid);
+        }
+        catch (Exception e) {
+            logError("nats.client: Error (%s) subscribing on (%s). Disconnecting from Nats.", e.msg, s.subject);
+            disconnect();
+        }
     }
 
 
@@ -486,7 +523,7 @@ final class Nats
                     if (subscription.msgsReceived > subscription.msgsToExpire)
                         subscription.closed = true;
                     if (subscription.closed)
-                        logWarn("nats.client: Message received on closed subscription! (msg.subject: %s, subscription: %s)", 
+                        logWarn("nats.client: Discarding message received on closed subscription! (msg.subject: %s, subscription: %s)", 
                             msg.subject, subscription.subject);
                     else
                         // now call the message handler
@@ -531,19 +568,29 @@ final class Nats
         _info = parseJsonString(msg.payloadAsString);
     }
 
-    void inboxHandler(scope Msg msg) @safe
+    void inboxHandler(scope Msg msg) @safe nothrow
     {
         import std.algorithm.searching: findSplitAfter;
         import std.conv: to;
         
         version (NatsClientLogging) 
             logDebugV("Inbox %s handler called with msg: %s", msg.subject, msg.payloadAsString);
-        auto findInbox = msg.subject.findSplitAfter("_.");
-        if (!findInbox) {
-            logWarn("nats.client: Discarding unexpected response in inbox: %s", msg.subject);
+        uint inbox;
+        bool badResponse = false;
+        try {
+            auto findInbox = msg.subject.findSplitAfter("_.");
+            if (!findInbox) 
+                badResponse = true;
+            else
+                inbox = findInbox[1].to!uint;
+        }
+        catch (Exception e) {
+            badResponse = true;
+        }
+        if (badResponse) {
+            logWarn("nats.client: Unexpected msg (%s) received in inbox. Discarding.", msg.subject);
             return;
         }
-        auto inbox = findInbox[1].to!uint;
         auto p_handler = (inbox in _inboxes);
         if (p_handler !is null) {
             (*p_handler)(msg);
@@ -552,7 +599,6 @@ final class Nats
         else {
             logWarn("nats.client: No response handler for response in inbox: %s. Response discarded.", 
                 msg.subject);
-            return;
         }
     }
 }
