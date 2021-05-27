@@ -19,7 +19,10 @@ void main(string[] args)
     logInfo("Starting Nats client version: %s", Nats.natsClientVersion);
     natsConn.connect();
 
-    runTask({
+    runTask(() nothrow {
+            // use giant try/catch bazooka to ensure task is nothrow
+            // this is needed to avoid deprecations in vibe-core 1.18+
+            try {
                 sleep(50.msecs);
                 natsConn.subscribe(">", toDelegate(&sub_all_handler));
                 logInfo("Sent subscribe all.");
@@ -34,14 +37,19 @@ void main(string[] args)
                 sleep(5000.msecs);
                 natsConn.publish("greetings", cast(ubyte[])"Still there?");
                 natsConn.publishRequest("query", cast(ubyte[])"722739", toDelegate(&response_handler));
-            });
+            }
+            catch (Exception e) {
+                logError("Exception thrown in test messages: (%s)", e.msg);
+            }
+        });
 
     runApplication();
 }
 
 void shutdown_handler(scope Msg msg) @safe nothrow
 {
-    logInfo("Shutdown msg received. Shutting down.");
+    logInfo("Shutdown msg received. Disconnecting and shutting down.");
+    natsConn.close();
     exitEventLoop();
 }
 
@@ -61,14 +69,19 @@ void query_responder(scope Msg msg) @safe nothrow
     import std.format: sformat;
     import std.random: uniform;
 
-    void responder(string reply, int data, Nats conn)
+    void responder(string reply, int data, Nats conn) @safe nothrow
     {
-        char[80] buffer;
-        int delay = uniform(0, 200);
-        logInfo("responder %d --> starting %d ms long calc...", data, delay);  
-        sleep(delay.msecs); 
-        logInfo("responder %d --> done. Sending reponse to %s", data, reply);
-        conn.publish(reply, buffer.sformat!"Answering query number %d"(data));
+        try {
+            char[80] buffer;
+            int delay = uniform(0, 200);
+            logInfo("responder %d --> starting %d ms long calc...", data, delay);  
+            sleep(delay.msecs); 
+            logInfo("responder %d --> done. Sending reponse to %s", data, reply);
+            conn.publish(reply, buffer.sformat!"Answering query number %d"(data));
+        }
+        catch (Exception e) {
+            logError("Responder failed with exception: (%s)", e.msg);
+        }
     }
 
     // note: we runTask to avoid blocking the listener task

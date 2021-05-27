@@ -60,6 +60,6 @@ struct NatsClientConfig
     Duration    connectTimeout = 15.seconds;
 }
 
-enum NatsState : byte { CONNECTING, CONNECTED, DISCONNECTED, RECONNECTING, CLOSED }
+enum NatsState : byte { INIT, CONNECTING, CONNECTED, DISCONNECTED, RECONNECTING, CLOSED }
 
 enum NatsResponse : byte { FRAGMENT, MSG, MSG_REPLY, PING, PONG, INFO, OK, ERR }

@@ -8,7 +8,7 @@ import std.exception;
 public import nats.interface_;
 import nats.parser;
 
-enum VERSION = "nats_v0.4.0";
+enum VERSION = "nats_v0.5.0";
 
 // Allow quietening the debug logging from nats client
 version (NatsClientQuiet) {}
@@ -89,6 +89,7 @@ final class Nats
         _connectTimeout = config.connectTimeout;
 
         _connectMutex = new TaskMutex;
+        _connStateChange = new TaskCondition(_connectMutex);
         _flushMutex = new TaskMutex;
         _writeMutex = new RecursiveTaskMutex;
         _flushSync = new TaskCondition(_flushMutex);
@@ -120,7 +121,7 @@ final class Nats
 
     bool connected() @safe const nothrow
     {
-        return (_connState == NatsState.CONNECTED && _conn.connected);
+        return (_connState == NatsState.CONNECTED);
     }
 
 
@@ -204,7 +205,7 @@ final class Nats
         try 
             write(PING);
         catch (Exception e) {
-            logError("nats.client: Flush write error (%s). Disconnecting from Nats.", e.msg);
+            logError("nats.client: Flush write error (%s)", e.msg);
             disconnect();
         }
         _pingSent++;
@@ -215,17 +216,24 @@ final class Nats
 
     void disconnect() @safe nothrow
     {
-        _connectMutex.lock();
-        scope(exit) _connectMutex.unlock();
-        
+        if (_connState != NatsState.DISCONNECTED) {
+            logWarn("nats.client: Disconnecting from Nats.");
+            _connState = NatsState.DISCONNECTED;
+            _connStateChange.notify();
+        }
+    }
+
+    void close() @safe nothrow
+    {
         if (_connState != NatsState.CLOSED) {
             logInfo("nats.client: Closing TCP connection to Nats server.");
             try 
                 _conn.close();
             catch (Exception e) {
-                logError("nats client: Error (%s) closing TCP connection!");
+                logError("nats.client: Error (%s) closing TCP connection!");
             }
             _connState = NatsState.CLOSED;
+            _connStateChange.notify();
         }
     }
 
@@ -236,6 +244,7 @@ final class Nats
     TCPConnection 		 _conn;
     RecursiveTaskMutex	 _writeMutex;
     TaskMutex            _connectMutex;
+    TaskCondition        _connStateChange;
     TaskMutex 			 _flushMutex;
     TaskCondition   	 _flushSync;
     Duration 			 _lastFlushRTT;
@@ -264,147 +273,197 @@ final class Nats
     NatsHandler[uint]    _inboxes;
 
 
-    void connector() @safe
+    void setupNatsConnection() @safe nothrow
     {
         import vibe.data.json: serializeToJsonString;
 
         char[OUTCMD_BUFSIZE] buffer = void;
         char[] cmd;
 
-        while (!connected() && _connState != NatsState.CLOSED)
-        {
-            _connectMutex.lock();
-            scope(exit) _connectMutex.unlock();
-
-            auto initialState = _connState;
-            version (NatsClientLogging) logDebug("Connector: Establishing connection to NATS server (%s) port %s ...", _host, _port);
-            try
-                _conn = connectTCP(_host, _port, null, 0, 5.seconds);
-            catch (Exception e) {
-                version (NatsClientLogging) logDebug("nats.client Connector: Exception whilst attempting connect to Nats server, msg: %s", e.msg);
-            }
-            if (_conn.connected)
-            {
-                _conn.keepAlive(true);
-                _conn.tcpNoDelay(true);
-                _conn.readTimeout(10.seconds);
-                _connState = NatsState.CONNECTED;
-                // start the listener & heartbeater tasks		
-                _listener = runTask(&listener);
-                _heartbeater = runTask(&heartbeater);
-                // send the CONNECT string
-                cmd = buffer.sformat("CONNECT %s", serializeToJsonString(_connectInfo));
-                version (NatsClientLogging) logDebug("Connector: Connected! Sending: %s", cmd);
-                write(cmd);
-                auto rtt = flush();
-                version (NatsClientLogging) logDebug("Connector: Flush roundtrip (%s) completed. Nats connection ready.", rtt);
-                // create a connection specific inbox subscription
-                _inboxPrefix = "_INBOX_" ~ _conn.localAddress.toString() ~ "_.";
-                auto inbox = new Subscription;
-                inbox.subject = _inboxPrefix ~ "*";
-                inbox.sid = 0;
-                inbox.handler = &inboxHandler;
-                //_subs[0] is always my _INBOX_ so just replace any existing one
-                if (_subs.length == 0) 
-                    _subs ~= inbox;
-                else
-                    _subs[0] = inbox;
-                version (NatsClientLogging) logDebug("nats.client Connector: Sending inbox subscription: %s", inbox.subject);
-                sendSubscribe(inbox);
-                if (initialState == NatsState.RECONNECTING && _subs.length > 1) 
-                {
-                    version (NatsClientLogging) logInfo("nats.client Connector: Re-sending active subscriptions after reconnection to Nats server.");
-                    foreach (priorSubscription; _subs[1..$]) {
-                        if (!priorSubscription.closed) sendSubscribe(priorSubscription);
-                    }
-                }
-                // go async here until we need to reconnect...
-                _listener.join();
-                _heartbeater.join();
-                _connState = NatsState.RECONNECTING;
-                _pingSent = 0;
-                _pongRecv = 0; 
-            }
-            else
-                logWarn("nats.client Connector: Connection attempt to %s failed.", _host);
-            sleep(_reconnectInterval);
+        _conn.keepAlive(true);
+        _conn.tcpNoDelay(true);
+        // send the CONNECT string
+        try {
+            _conn.readTimeout(10.seconds);
+            cmd = buffer.sformat("CONNECT %s", serializeToJsonString(_connectInfo));
+            version (NatsClientLogging) logDebug("nats.client: Socket connected. Sending: %s", cmd);
+            write(cmd);
         }
+        catch (Exception e) {
+            logError("nats.client: Failed to send initial CONNECT string (%s).", e.msg);
+            return;
+        }
+        auto rtt = flush();
+        version (NatsClientLogging) logDebug("nats.client: Flush roundtrip (%s) completed.", rtt);
+        // create a connection specific inbox subscription
+        _inboxPrefix = "_INBOX_" ~ _conn.localAddress.toString() ~ "_.";
+        auto inbox = new Subscription;
+        inbox.subject = _inboxPrefix ~ "*";
+        inbox.sid = 0;
+        inbox.handler = &inboxHandler;
+        //_subs[0] is always my _INBOX_ so just replace any existing one
+        if (_subs.length == 0) 
+            _subs ~= inbox;
+        else
+            _subs[0] = inbox;
+        version (NatsClientLogging) logDebug("nats.client: Setting up inbox subscription: %s", inbox.subject);
+        sendSubscribe(inbox);
+        if (_subs.length > 1) 
+        {
+            version (NatsClientLogging) logDebug("nats.client: Re-sending active subscriptions after reconnection to Nats server.");
+            foreach (priorSubscription; _subs[1..$]) {
+                if (!priorSubscription.closed) sendSubscribe(priorSubscription);
+            }
+        }
+        _connState = NatsState.CONNECTED;
+    }
+
+    void connector() @safe nothrow
+    {
+        import std.random: uniform;
+        auto reconnectTimer = createTimer(null);
+        _connectMutex.lock();
+        scope(exit) _connectMutex.unlock();
+        
+        connector:
+        while (_connState != NatsState.CLOSED) {
+            final switch (_connState) {
+                case NatsState.INIT:
+                case NatsState.RECONNECTING:
+                    version (NatsClientLogging) logDebug("nats.client: Establishing connection to NATS server (%s) port %s ...", _host, _port);
+                    try {
+                        if (_conn.connected)
+                            _conn.close();
+                        _connState = NatsState.CONNECTING;
+                        _conn = connectTCP(_host, _port, null, 0, 5.seconds);
+                    }
+                    catch (Exception e) {
+                        logWarn("nats.client: Exception whilst attempting connect to Nats server, msg: %s", e.msg);
+                    }
+                    break;
+                
+                case NatsState.CONNECTING:
+                    if (_conn.connected) {
+                        _listener = runTask(&listener);
+                        setupNatsConnection();
+                    } else {
+                        logWarn("nats.client Connector: Connection attempt to %s failed.", _host);
+                        _connState = NatsState.DISCONNECTED;
+                    }
+                    break;                   
+
+                case NatsState.DISCONNECTED:
+                    // wait for an interval + random extra delay to avoid thundering herd on Nats server down
+                    try {
+                        Duration delay = _reconnectInterval + uniform(0, 1000).msecs;
+                        logInfo("nats.client: Waiting %s before attempting reconnect.", delay);
+                        reconnectTimer.rearm(delay, false);
+                        reconnectTimer.wait();
+                    }
+                    catch (Exception e) {
+                        logWarn("nats.client: Reconnect timer interrupted.");
+                        break;
+                    }
+                    _connState = NatsState.RECONNECTING;
+                    break;
+
+                case NatsState.CONNECTED:
+                    logInfo("nats.client: Nats connection ready.");
+                    _heartbeater = runTask(&heartbeater);
+                    _connStateChange.wait();
+                    break;
+
+                case NatsState.CLOSED:
+                    break connector;
+            }
+        }
+        version (NatsClientLogging) logDebug("nats.client: Connector task terminating.");
     }
 
 
-    void listener() @safe
+    void listener() @safe nothrow
     {
         version (NatsClientLogging) logDebug("nats.client: listener task started.");
+        try {
+            enum size_t readSize = 2048;
+            Nbuff buffer;
 
-        enum size_t readSize = 512;
-        Nbuff buffer;
-
-        while(connected())
-        {
-            // task blocks here until we receive data. No timeout as that is handled
-            // by the heartbeater task.
-            auto result = _conn.waitForDataEx();
-            if (result == WaitForDataStatus.dataAvailable)
-            {
-                auto readBuffer = Nbuff.get(readSize);
-                auto readBufferSpace = () @trusted { return readBuffer.data(); }();
-                immutable bytesRead = _conn.read(readBufferSpace, IOMode.once);
-                _bytesReceived += bytesRead;
-                // append this newly read chunk to the buffer and process
-                buffer.append(readBuffer, bytesRead);
-                size_t consumed = processNatsStream(buffer);
-                version (NatsClientLogging) {
-                    if (consumed < buffer.length)
-                        logTrace("Fragment (length: %s) left in buffer. Consolidating with another read.", buffer.length - consumed);
+            while(_connState == NatsState.CONNECTING || _connState == NatsState.CONNECTED) {
+                // task blocks here until we receive data. No timeout as that is handled
+                // by the heartbeater task.
+                auto result = _conn.waitForDataEx();
+                if (result == WaitForDataStatus.dataAvailable) {
+                    auto readBuffer = Nbuff.get(readSize);
+                    auto readBufferSpace = () @trusted { return readBuffer.data(); }();
+                    immutable bytesRead = _conn.read(readBufferSpace, IOMode.once);
+                    _bytesReceived += bytesRead;
+                    // append this newly read chunk to the buffer and process
+                    buffer.append(readBuffer, bytesRead);
+                    size_t consumed = processNatsStream(buffer);
+                    version (NatsClientLogging) {
+                        if (consumed < buffer.length)
+                            logTrace("Fragment (length: %s) left in buffer. Consolidating with another read.", buffer.length - consumed);
+                    }
+                    // free fully processed messages from the buffer
+                    buffer.pop(consumed);
                 }
-                // free fully processed messages from the buffer
-                buffer.pop(consumed);
-            }
-            else if (result == WaitForDataStatus.noMoreData)
-            {
-                logError("nats.client: Listener read session closed unexpectedly: %s", result);
-                if (connected()) {
-                    // ensure underlying TCP connection is closed - state might not yet reflect this
-                    _conn.close();  
-                    _connState = NatsState.DISCONNECTED;
+                else if (result == WaitForDataStatus.noMoreData) {
+                    throw new Exception("WaitForDataStatus.noMoreData");
                 }
             }
         }
-        logWarn("nats.client: Nats session disconnected! Listener task terminating. Connector will attempt reconnect.");
+        catch (Exception e) {
+            logWarn("nats.client: Nats session disconnected! (%s).", e.msg);
+            disconnect();
+        }
+        version (NatsClientLogging) logDebug("nats.client: Listener task terminating. Connector will attempt reconnect.");
     }
 
 
-    void heartbeater() @safe
+    void heartbeater() @safe nothrow
     {
         version (NatsClientLogging) logDebug("nats.client: heartbeater task started.");
 
         auto timer = createTimer(null);
-        while(connected())
+        bool flushPending = false;
+
+        void heartbeat() @safe nothrow
         {
-            auto prevSent = _msgSent;
-            auto prevRecv = _msgRecv;
-            auto prevPing = _pingRecv;
-            bool flushPending = false;
-            timer.rearm(_heartbeatInterval, false);
-            timer.wait();
-            //sleep(_heartbeatInterval);
-            if (!flushPending && _msgSent == prevSent && _msgRecv == prevRecv && _pingRecv == prevPing && connected()) {
-                version (NatsClientLogging) logDebugV("nats.client: Nats connection idle for %s. Sending heartbeat.",
-                    _heartbeatInterval);
-                runTask({
-                    flushPending = true;
-                    auto rtt = flush();
-                    version (NatsClientLogging) logDebugV("nats.client: Nats Heartbeat RTT: %s", rtt);
-                    flushPending = false;
-                });
-            } else if (flushPending) {
-                logError("nats.client: Heartbeat did not return within heartbeat interval (%s).", _heartbeatInterval);
-                _conn.close();
-                _connState = NatsState.DISCONNECTED;
-                break;
+            flushPending = true;
+            scope(exit) flushPending = false;
+            auto t = runTask(() @safe nothrow {
+                auto rtt = flush();
+                version (NatsClientLogging) logDebug("nats.client: Nats Heartbeat RTT: %s", rtt);
+            });
+            try
+                t.join();
+            catch (Exception e) {
+                logWarn("nats.client: Heartbeat flush failed to sync.");
+                disconnect();
             }
         }
-        logWarn("nats.client: Nats session disconnected! Heartbeater task terminating.");
+
+        while(_connState == NatsState.CONNECTED) {
+            auto prevSent = _msgSent + _pingSent;
+            auto prevRecv = _msgRecv + _pingRecv;
+            timer.rearm(_heartbeatInterval, false);
+            try
+                timer.wait();
+            catch (Exception e) {
+                logWarn("nats.client: Heartbeat timer interrupted.");
+                break;
+            }
+            logDebug("Heartbeat timer fires! prevSent:%d sent:%d, prevRecv:%d recv:%d", prevSent, _bytesSent, prevRecv, _bytesReceived);
+            if (_msgSent + _pingSent == prevSent && _msgRecv + _pingRecv == prevRecv && _connState == NatsState.CONNECTED) {
+                version (NatsClientLogging) logDebugV("nats.client: Nats connection idle for %s. Sending heartbeat.",
+                    _heartbeatInterval);
+                runTask(&heartbeat);
+            } else if (flushPending) {
+                logError("nats.client: Heartbeat did not return within heartbeat interval (%s).", _heartbeatInterval);
+                disconnect();
+            }
+        }
+        version (NatsClientLogging) logWarn("nats.client: Nats session not connected! Heartbeater task terminating.");
     }
 
 
@@ -424,7 +483,7 @@ final class Nats
             _msgSent++;
         }
         catch (Exception e) {
-            logError("nats.client: Publish failed (%s), command (%s). Disconnecting from Nats.", e.msg, cmd);
+            logError("nats.client: Publish failed (%s), command (%s)", e.msg, cmd);
             disconnect();
         }
     }
@@ -443,7 +502,7 @@ final class Nats
             write(cmd);
         }
         catch (Exception e) {
-            logError("nats.client: Error (%s) subscribing on (%s). Disconnecting from Nats.", e.msg, s.subject);
+            logError("nats.client: Error (%s) subscribing on (%s)", e.msg, s.subject);
             disconnect();
         }
     }
