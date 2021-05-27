@@ -8,7 +8,7 @@ import std.exception;
 public import nats.interface_;
 import nats.parser;
 
-enum VERSION = "nats_v0.5.0";
+enum VERSION = "nats_v0.5.1";
 
 // Allow quietening the debug logging from nats client
 version (NatsClientQuiet) {}
@@ -330,7 +330,8 @@ final class Nats
             final switch (_connState) {
                 case NatsState.INIT:
                 case NatsState.RECONNECTING:
-                    version (NatsClientLogging) logDebug("nats.client: Establishing connection to NATS server (%s) port %s ...", _host, _port);
+                    version (NatsClientLogging) logDiagnostic(
+                        "nats.client: Establishing connection to NATS server (%s) port %s ...", _host, _port);
                     try {
                         if (_conn.connected)
                             _conn.close();
@@ -377,13 +378,13 @@ final class Nats
                     break connector;
             }
         }
-        version (NatsClientLogging) logDebug("nats.client: Connector task terminating.");
+        version (NatsClientLogging) logDiagnostic("nats.client: Connector task terminating.");
     }
 
 
     void listener() @safe nothrow
     {
-        version (NatsClientLogging) logDebug("nats.client: listener task started.");
+        version (NatsClientLogging) logDiagnostic("nats.client: listener task started.");
         try {
             enum size_t readSize = 2048;
             Nbuff buffer;
@@ -416,13 +417,13 @@ final class Nats
             logWarn("nats.client: Nats session disconnected! (%s).", e.msg);
             disconnect();
         }
-        version (NatsClientLogging) logDebug("nats.client: Listener task terminating. Connector will attempt reconnect.");
+        version (NatsClientLogging) logDiagnostic("nats.client: Listener task terminating. Connector will attempt reconnect.");
     }
 
 
     void heartbeater() @safe nothrow
     {
-        version (NatsClientLogging) logDebug("nats.client: heartbeater task started.");
+        version (NatsClientLogging) logDiagnostic("nats.client: heartbeater task started.");
 
         auto timer = createTimer(null);
         bool flushPending = false;
@@ -453,7 +454,6 @@ final class Nats
                 logWarn("nats.client: Heartbeat timer interrupted.");
                 break;
             }
-            logDebug("Heartbeat timer fires! prevSent:%d sent:%d, prevRecv:%d recv:%d", prevSent, _bytesSent, prevRecv, _bytesReceived);
             if (_msgSent + _pingSent == prevSent && _msgRecv + _pingRecv == prevRecv && _connState == NatsState.CONNECTED) {
                 version (NatsClientLogging) logDebugV("nats.client: Nats connection idle for %s. Sending heartbeat.",
                     _heartbeatInterval);
@@ -463,7 +463,7 @@ final class Nats
                 disconnect();
             }
         }
-        version (NatsClientLogging) logWarn("nats.client: Nats session not connected! Heartbeater task terminating.");
+        version (NatsClientLogging) logDiagnostic("nats.client: Nats session not connected! Heartbeater task terminating.");
     }
 
 
