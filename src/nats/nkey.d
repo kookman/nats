@@ -14,13 +14,27 @@ class NkeyException : Exception {
 enum NATS_CRYPTO_SIGN_BYTES = 64;
 enum NATS_CRYPTO_SECRET_BYTES = 64;
 
-ubyte[] natsSign(in string encodedSeed, in ubyte[] input) {
+ubyte[] natsSign(in string encodedSeed, in ubyte[] input) @safe
+{
+    import std.exception: enforce;
+    
     auto seed = decodeSeed(encodedSeed);
     auto key = extractKeyFromSeed(seed);
     auto signed = cryptoSign(input, key);
-    seed[] = 0;
-    key[] = 0;
+    auto check = secureZero(seed) + secureZero(key);
+    enforce(check == 0, "Secrets not zeroed!");
     return signed;
+}
+
+int secureZero(ref ubyte[] secret) @trusted
+{
+    // we use C memset function here and return a checksum in an attempt to avoid this code
+    // being elided by the compiler's optimisations
+    import core.stdc.string: memset;
+    import std.algorithm.iteration: sum;
+
+    memset(secret.ptr, 0, secret.length);
+    return sum(secret);
 }
 
 unittest {
@@ -54,7 +68,7 @@ unittest {
 
 private:
 
-ubyte[] decodeSeed(in string encodedSeed)
+ubyte[] decodeSeed(in string encodedSeed) @safe
 {
     auto decodedSeed = decodeBase32(encodedSeed);
     if (decodedSeed.length < 4)
@@ -83,7 +97,8 @@ ubyte[] decodeSeed(in string encodedSeed)
 
 enum base32Alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 
-ubyte[] decodeBase32(string encoded) {
+ubyte[] decodeBase32(string encoded) @safe
+{
     import std.string: indexOf, stripRight;
 
     // Remove padding if present
@@ -170,7 +185,7 @@ enum ubyte PREFIX_BYTE_ACCOUNT = 0;        // Base32-encodes to 'A...';
 // PREFIX_BYTE_USER is the version byte used for encoded NATS Users
 enum ubyte PREFIX_BYTE_USER = 20 << 3;     // Base32-encodes to 'U...'
 
-bool isValidPublicPrefixByte(ubyte b)
+bool isValidPublicPrefixByte(ubyte b) @safe
 {
     switch (b)
     {
@@ -185,7 +200,7 @@ bool isValidPublicPrefixByte(ubyte b)
 }
 
 // Returns the 2-byte crc for the data provided.
-ushort nats_CRC16_Compute(ubyte[] data)
+ushort nats_CRC16_Compute(ubyte[] data) @safe
 {
     ushort crc;
 
@@ -197,7 +212,7 @@ ushort nats_CRC16_Compute(ubyte[] data)
 }
 
 // Checks the calculated crc16 checksum for data against the expected.
-bool nats_CRC16_Validate(ubyte[] data, ushort expected)
+bool nats_CRC16_Validate(ubyte[] data, ushort expected) @safe
 {
     ushort crc = nats_CRC16_Compute(data);
     return crc == expected;
@@ -249,7 +264,7 @@ static immutable ushort[256] crc16tab = [
     0x6e17, 0x7e36, 0x4e55, 0x5e74, 0x2e93, 0x3eb2, 0x0ed1, 0x1ef0,
 ];
 
-ubyte[] cryptoSign(in ubyte[] msg, const(ubyte[]) signingKey)
+ubyte[] cryptoSign(in ubyte[] msg, const(ubyte[]) signingKey) @trusted
 {
     // we need to pass signedMsglen as a pointer as reqd by sol_nacl API
     size_t signedMsglen = NATS_CRYPTO_SIGN_BYTES + msg.length;  
@@ -258,7 +273,7 @@ ubyte[] cryptoSign(in ubyte[] msg, const(ubyte[]) signingKey)
     return signedMsg;
 }
 
-ubyte[] extractKeyFromSeed(in ubyte[] seed)
+ubyte[] extractKeyFromSeed(in ubyte[] seed) @trusted
 {
     auto key = new ubyte[NATS_CRYPTO_SECRET_BYTES];
     newKeyFromSeed(seed.ptr, key.ptr);
