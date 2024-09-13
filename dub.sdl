@@ -1,14 +1,17 @@
 name "nats"
 description "A nats pubsub client for vibe.d"
 authors "kookman"
-copyright "Copyright © 2019-2021, kookman"
+copyright "Copyright © 2019-2024, kookman"
 license "MIT"
-dependency "vibe-d:core" version="~>0.9"
-dependency "vibe-d:data" version="~>0.9"
-dependency "vibe-d:inet" version="~>0.9"
+dependency "vibe-core" version="~>2.9"
+dependency "vibe-serialization" version="~>1.0"
+dependency "vibe-inet" version="~>1.0"
 dependency "nbuff" version="~>0.1"
 
-dflags "-preview=dip25" "-preview=dip1000" "-preview=in"
+cSourcePaths "src/nats"
+
+//dflags "-preview=dip1000" "-preview=in"
+dflags "-preview=in"
 
 configuration "lib" {
     targetType "library"
