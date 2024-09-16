@@ -8,7 +8,7 @@ import std.exception;
 public import nats.interface_;
 import nats.parser;
 
-enum VERSION = "nats_v0.5.1";
+enum VERSION = "nats_v0.5.2";
 
 // Allow quietening the debug logging from nats client
 version (NatsClientQuiet) {}
@@ -286,7 +286,8 @@ final class Nats
         try {
             _conn.readTimeout(10.seconds);
             cmd = buffer.sformat("CONNECT %s", serializeToJsonString(_connectInfo));
-            version (NatsClientLogging) logDebug("nats.client: Socket connected. Sending: %s", cmd);
+            version (NatsClientLogging)
+                logDebug("nats.client: Socket connected. Sending: %s", cmd);
             write(cmd);
         }
         catch (Exception e) {
@@ -294,7 +295,8 @@ final class Nats
             return;
         }
         auto rtt = flush();
-        version (NatsClientLogging) logDebug("nats.client: Flush roundtrip (%s) completed.", rtt);
+        version (NatsClientLogging)
+            logDebug("nats.client: Flush roundtrip (%s) completed.", rtt);
         // create a connection specific inbox subscription
         _inboxPrefix = "_INBOX_" ~ _conn.localAddress.toString() ~ "_.";
         auto inbox = new Subscription;
@@ -306,11 +308,13 @@ final class Nats
             _subs ~= inbox;
         else
             _subs[0] = inbox;
-        version (NatsClientLogging) logDebug("nats.client: Setting up inbox subscription: %s", inbox.subject);
+        version (NatsClientLogging)
+            logDebug("nats.client: Setting up inbox subscription: %s", inbox.subject);
         sendSubscribe(inbox);
         if (_subs.length > 1) 
         {
-            version (NatsClientLogging) logDebug("nats.client: Re-sending active subscriptions after reconnection to Nats server.");
+            version (NatsClientLogging)
+                logDebug("nats.client: Re-sending active subscriptions after reconnection to Nats server.");
             foreach (priorSubscription; _subs[1..$]) {
                 if (!priorSubscription.closed) sendSubscribe(priorSubscription);
             }
@@ -403,7 +407,8 @@ final class Nats
                     size_t consumed = processNatsStream(buffer);
                     version (NatsClientLogging) {
                         if (consumed < buffer.length)
-                            logTrace("Fragment (length: %s) left in buffer. Consolidating with another read.", buffer.length - consumed);
+                            logTrace("Fragment (length: %s) left in buffer. Consolidating with another read.",
+                                buffer.length - consumed);
                     }
                     // free fully processed messages from the buffer
                     buffer.pop(consumed);
@@ -417,7 +422,8 @@ final class Nats
             logWarn("nats.client: Nats session disconnected! (%s).", e.msg);
             disconnect();
         }
-        version (NatsClientLogging) logDiagnostic("nats.client: Listener task terminating. Connector will attempt reconnect.");
+        version (NatsClientLogging)
+            logDiagnostic("nats.client: Listener task terminating. Connector will attempt reconnect.");
     }
 
 
@@ -434,7 +440,8 @@ final class Nats
             scope(exit) flushPending = false;
             auto t = runTask(() @safe nothrow {
                 auto rtt = flush();
-                version (NatsClientLogging) logDebug("nats.client: Nats Heartbeat RTT: %s", rtt);
+                version (NatsClientLogging)
+                    logDebug("nats.client: Nats Heartbeat RTT: %s", rtt);
             });
             try
                 t.join();
@@ -454,20 +461,23 @@ final class Nats
                 logWarn("nats.client: Heartbeat timer interrupted.");
                 break;
             }
-            if (_msgSent + _pingSent == prevSent && _msgRecv + _pingRecv == prevRecv && _connState == NatsState.CONNECTED) {
-                version (NatsClientLogging) logDebugV("nats.client: Nats connection idle for %s. Sending heartbeat.",
-                    _heartbeatInterval);
+            if (_msgSent + _pingSent == prevSent && _msgRecv + _pingRecv == prevRecv
+                    && _connState == NatsState.CONNECTED) {
+                version (NatsClientLogging) 
+                    logDebugV("nats.client: Nats connection idle for %s. Sending heartbeat.", _heartbeatInterval);
                 runTask(&heartbeat);
             } else if (flushPending) {
                 logError("nats.client: Heartbeat did not return within heartbeat interval (%s).", _heartbeatInterval);
                 disconnect();
             }
         }
-        version (NatsClientLogging) logDiagnostic("nats.client: Nats session not connected! Heartbeater task terminating.");
+        version (NatsClientLogging)
+            logDiagnostic("nats.client: Nats session not connected! Heartbeater task terminating.");
     }
 
 
-    void sendPublish(T)(scope const(char)[] subject, scope const(T)[] payload, scope const(char)[] replySubject = null) @safe nothrow
+    void sendPublish(T)(scope const(char)[] subject, scope const(T)[] payload, 
+                            scope const(char)[] replySubject = null) @safe nothrow
         if (is(Unqual!T == ubyte) || is(Unqual!T == char))
     {
         char[OUTCMD_BUFSIZE] buffer = void;
@@ -582,8 +592,8 @@ final class Nats
                     if (subscription.msgsReceived > subscription.msgsToExpire)
                         subscription.closed = true;
                     if (subscription.closed)
-                        logWarn("nats.client: Discarding message received on closed subscription! (msg.subject: %s, subscription: %s)", 
-                            msg.subject, subscription.subject);
+                        logWarn("nats.client: Discarding message received on closed subscription!"
+                            ~ " (msg.subject: %s, subscription: %s)", msg.subject, subscription.subject);
                     else
                         // now call the message handler
                         // note: this is a synchronous callback - don't block the event loop for too long
@@ -624,7 +634,9 @@ final class Nats
     {
         import vibe.data.json: parseJsonString;
 
-        _info = parseJsonString(msg.payloadAsString);
+        // copy the message payload as we will be retaining it
+        string serverjson = msg.payloadAsString.idup;
+        _info = parseJsonString(serverjson);
     }
 
     void inboxHandler(scope Msg msg) @safe nothrow
