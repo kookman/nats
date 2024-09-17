@@ -97,7 +97,7 @@ ubyte[] decodeSeed(in string encodedSeed) @safe
 
 enum base32Alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 
-ubyte[] decodeBase32(string encoded) @safe
+ubyte[] decodeBase32(scope string encoded) @safe
 {
     import std.string: indexOf, stripRight;
 

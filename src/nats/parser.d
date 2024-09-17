@@ -20,7 +20,7 @@ enum SPACE = " ".representation;
 enum TAB = "\t".representation;
 
 
-size_t parseNats(scope const(ubyte)[] response, out Msg msg) @safe
+size_t parseNats(return ref Msg msg, const(ubyte)[] response) @safe
 {
     import std.algorithm.comparison: equal;
     import std.algorithm.searching: findSplitAfter, startsWith;

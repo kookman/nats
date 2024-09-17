@@ -12,7 +12,7 @@ struct Msg
     const(ubyte)[] payload;
     NatsResponse   type;
 
-    scope string payloadAsString() @trusted
+    scope string payloadAsString() return @trusted
     {
         import std.string: assumeUTF;
         import std.exception: assumeUnique;

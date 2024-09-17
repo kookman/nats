@@ -554,7 +554,7 @@ final class Nats
             auto responseData = () @trusted { return natsResponse.data().data(); }();
             version (NatsClientLogging)
                 logTrace("Sending response slice length %d to parseNats.", responseData.length);
-            consumed = parseNats(responseData, msg);
+            consumed = parseNats(msg, responseData);
 
             final switch (msg.type)
             {	
