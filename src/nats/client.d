@@ -21,9 +21,11 @@ final class Nats
     import std.traits: Unqual;
     import eventcore.core: IOMode;
     import vibe.core.net: TCPConnection, connectTCP, WaitForDataStatus;
+    import vibe.core.stream: Stream;
     import vibe.core.sync: TaskCondition, RecursiveTaskMutex, TaskMutex;
     import vibe.data.json: Json;
-    import nbuff: Nbuff;
+    import vibe.container.ringbuffer: RingBuffer;
+    import vibe.internal.interfaceproxy: InterfaceProxy;
 
     public:
 
@@ -48,7 +50,7 @@ final class Nats
         ulong msgsSent;
     }
 
-    this(string natsUri = "nats://127.0.0.1:4222", string name = null) @trusted
+    this(string natsUri = "nats://127.0.0.1:4222", string name = null) @safe
     {
         NatsClientConfig config;
         config.natsUri = natsUri;
@@ -56,7 +58,7 @@ final class Nats
         this(config);
     }
 
-    this(NatsClientConfig config) @trusted
+    this(NatsClientConfig config) @safe
     {
         import std.algorithm.searching: findSplit, startsWith;
         import std.format: format;
@@ -95,6 +97,8 @@ final class Nats
         _flushSync = new TaskCondition(_flushMutex);
         // reserve a sensible minimum amount of space for new subscriptions
         _subs.reserve(16);
+        // setup initial buffer size
+        _outBuffer.capacity = 64 * 1024;
     }
 
     unittest
@@ -108,7 +112,7 @@ final class Nats
         assert (nats._connectInfo.pass == "pass");
     }
 
-    ~this() @trusted
+    ~this() @safe
     {
         version (NatsClientLogging) logDebug("nats client object destroyed!");
     }
@@ -242,6 +246,7 @@ final class Nats
     enum OUTCMD_BUFSIZE = 256;
 
     TCPConnection 		 _conn;
+    InterfaceProxy!Stream _natsStream;
     RecursiveTaskMutex	 _writeMutex;
     TaskMutex            _connectMutex;
     TaskCondition        _connStateChange;
@@ -271,6 +276,8 @@ final class Nats
     NatsState			 _connState;
     string               _inboxPrefix;
     NatsHandler[uint]    _inboxes;
+    ubyte[]              _payloadBuffer;
+    RingBuffer!ubyte     _outBuffer;
 
 
     void setupNatsConnection() @safe nothrow
@@ -282,6 +289,7 @@ final class Nats
 
         _conn.keepAlive(true);
         _conn.tcpNoDelay(true);
+        _natsStream = _conn;
         // send the CONNECT string
         try {
             _conn.readTimeout(10.seconds);
@@ -390,28 +398,33 @@ final class Nats
     {
         version (NatsClientLogging) logDiagnostic("nats.client: listener task started.");
         try {
-            enum size_t readSize = 2048;
-            Nbuff buffer;
-
             while(_connState == NatsState.CONNECTING || _connState == NatsState.CONNECTED) {
                 // task blocks here until we receive data. No timeout as that is handled
                 // by the heartbeater task.
                 auto result = _conn.waitForDataEx();
                 if (result == WaitForDataStatus.dataAvailable) {
-                    auto readBuffer = Nbuff.get(readSize);
-                    auto readBufferSpace = () @trusted { return readBuffer.data(); }();
-                    immutable bytesRead = _conn.read(readBufferSpace, IOMode.once);
-                    _bytesReceived += bytesRead;
-                    // append this newly read chunk to the buffer and process
-                    buffer.append(readBuffer, bytesRead);
-                    size_t consumed = processNatsStream(buffer);
-                    version (NatsClientLogging) {
-                        if (consumed < buffer.length)
-                            logTrace("Fragment (length: %s) left in buffer. Consolidating with another read.",
-                                buffer.length - consumed);
-                    }
-                    // free fully processed messages from the buffer
-                    buffer.pop(consumed);
+                    processNatsStream();
+                    // bool chunkProcessed;
+                    // if (_inBuffer.empty) {
+                    //     // attempt to process directly from TCP socket buffer (zero copy)
+                    //     // size_t consumed = processNatsStream(_conn.peek());
+                    //     size_t consumed = 0;
+                    //     if (consumed) {
+                    //         _conn.skip(consumed);
+                    //         _bytesReceived += consumed;
+                    //         chunkProcessed = true;
+                    //     }
+                    // }
+                    // // add anything remaining in this read to the buffer, and attempt to process
+                    // immutable bytesRead = _conn.read(_inBuffer.peekDst, IOMode.immediate);
+                    // if (bytesRead > 0 && !chunkProcessed) {
+                    //     _bytesReceived += bytesRead;
+                    //     _inBuffer.putBackN(bytesRead);
+                    //     // size_t consumed = processNatsStream(_inBuffer[]);
+                    //     size_t consumed = 0;
+                    //     if (consumed > 0) 
+                    //         _inBuffer.removeFrontN(consumed);
+                    // }
                 }
                 else if (result == WaitForDataStatus.noMoreData) {
                     throw new Exception("WaitForDataStatus.noMoreData");
@@ -536,59 +549,60 @@ final class Nats
     }
 
 
-    size_t processNatsStream(ref Nbuff natsResponse) @safe
+    void processNatsStream() @safe
     {
-        import std.algorithm.comparison: min;
+        //import std.algorithm.comparison: min;
+        import std.array: appender;
+        import std.string: assumeUTF;
+        import vibe.stream.operations: readLine;
+        import vibe.inet.message: parseRFC5322Header;
 
-        size_t consumed = 0;
+        enum maxNatsProtocolLine = 2048;
+        enum maxStatusLength = 512;
+        auto protocolLine = appender!(ubyte[]);
+        protocolLine.reserve(maxNatsProtocolLine);
+        auto statusLine = appender!(ubyte[]);
+        statusLine.reserve(maxStatusLength);
         Subscription subscription;
     
         loop:
-        while(consumed < natsResponse.length)
-        {
+        while (_connState == NatsState.CONNECTING || _connState == NatsState.CONNECTED) {
             Msg msg;
-            Nbuff msgPayload;
-
-            if (consumed > 0)
-                natsResponse.pop(consumed);
-            auto responseData = () @trusted { return natsResponse.data().data(); }();
+            protocolLine.clear();
+            statusLine.clear();
+            
+            _natsStream.readLine(protocolLine);
             version (NatsClientLogging)
-                logTrace("Sending response slice length %d to parseNats.", responseData.length);
-            consumed = parseNats(msg, responseData);
+                logTrace("Sending NATS protocol line length %d to parseNats.", protocolLine.length);
+            parseNats(msg, protocolLine[]); 
 
             final switch (msg.type)
             {	
+                // note: Using streams means receiving a FRAGMENT should only occur in an error condition
                 case NatsResponse.FRAGMENT:
-                    if (consumed > 0) {
-                        break;
-                    } else {
-                        break loop;
-                    }
+                    break loop;
                         
                 case NatsResponse.MSG:
                 case NatsResponse.MSG_REPLY:
-                    immutable alreadyRead = min(msg.length, natsResponse.length - consumed);
-                    if (msg.length > alreadyRead)
-                    {
-                        version (NatsClientLogging) 
-                            logTrace("MSG payload exceeds initial buffer (length: %s).", msg.length);
-                        auto msgPayloadBuffer = Nbuff.get(msg.length - alreadyRead);
-                        auto remainingPayload = () @trusted { return msgPayloadBuffer.data(); }();
-                        immutable bytesRead = _conn.read(remainingPayload[0 .. msg.length - alreadyRead], IOMode.all);
-                        if (bytesRead < msg.length - alreadyRead)
-                        {
-                            logError("nats.client: Message payload incomplete! (expected: %s bytes)", msg.length);
+                    // read headers if it is a HMSG
+                    if (msg.headersLength) {
+                        _natsStream.readLine(statusLine);
+                        msg.headerStatusLine = statusLine[].assumeUTF;
+                        if (msg.headersLength - msg.headerStatusLine.length > 4) {
+                            // 4 is the length of the trailing double CRLF so there are more headers
+                            _natsStream.parseRFC5322Header(msg.headers);
                         }
-                        natsResponse.append(msgPayloadBuffer, bytesRead);
-                        _bytesReceived += bytesRead;
                     }
-                    msgPayload = natsResponse[consumed .. consumed + msg.length];
-                    consumed += msg.length;
-                    msg.payload = () @trusted { return msgPayload.data().data(); }();
+                    immutable expectedPayload = msg.length - msg.headersLength;
+                    immutable bytesRead = _natsStream.read(_payloadBuffer[0 .. expectedPayload], IOMode.all);
+                    if (bytesRead < expectedPayload) {
+                        logError("nats.client: Message payload incomplete! (expected: %s bytes)", expectedPayload);
+                    }
+                    msg.payload = _payloadBuffer[0 .. expectedPayload];
                     _msgRecv++;
                     subscription = _subs[msg.sid];
                     subscription.msgsReceived++;
-                    subscription.bytesReceived += msg.payload.length;
+                    subscription.bytesReceived += expectedPayload;
                     if (subscription.msgsReceived > subscription.msgsToExpire)
                         subscription.closed = true;
                     if (subscription.closed)
@@ -614,7 +628,7 @@ final class Nats
                     continue loop;
 
                 case NatsResponse.OK:
-                    version (NatsClientLogging) logDebug("Ok received.");
+                    version (NatsClientLogging) logDebug("Nats Ok received.");
                     continue loop;
 
                 case NatsResponse.INFO:
@@ -627,7 +641,6 @@ final class Nats
                     continue loop;
             }
         }
-        return consumed;		
     }
 
     void processServerInfo(scope Msg msg) @safe
@@ -637,6 +650,11 @@ final class Nats
         // copy the message payload as we will be retaining it
         string serverjson = msg.payloadAsString.idup;
         _info = parseJsonString(serverjson);
+        // allocate the payload buffer according to largest allowed
+        ulong maxPayloadSize = _info["max_payload"].get!ulong;
+        if (maxPayloadSize > _payloadBuffer.length) {
+            _payloadBuffer = new ubyte[maxPayloadSize];
+        }
     }
 
     void inboxHandler(scope Msg msg) @safe nothrow

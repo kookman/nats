@@ -1,6 +1,7 @@
 module nats.interface_;
 
 public import core.time: Duration, seconds;
+import vibe.inet.message: InetHeaderMap;
 
 struct Msg
 {
@@ -9,6 +10,9 @@ struct Msg
     uint           sid;
     uint           length;
     Subscription   subs;
+    const(char)[]  headerStatusLine;
+    InetHeaderMap  headers;
+    uint           headersLength;
     const(ubyte)[] payload;
     NatsResponse   type;
 
