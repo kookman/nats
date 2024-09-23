@@ -87,7 +87,7 @@ void parseNats(R)(return ref Msg msg, R protocolLine) @safe
             import vibe.core.log;
             logDebug("protocolLine: %s", protocolLine);
         }
-        throw new NatsProtocolException("Expected a valid NATS protocol line.");			
+        throw new NatsException("Expected a valid NATS protocol line.");			
     }
 }
 

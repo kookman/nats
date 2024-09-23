@@ -16,16 +16,25 @@ else version = NatsClientLogging;
 
 final class Nats
 {
-    import std.format: sformat;
+    import std.algorithm.searching: findSplit, findSplitAfter, startsWith;
+    import std.array: appender;
+    import std.conv: to;
+    import std.format: format, sformat;
+    import std.random: uniform;
     import std.socket: Address, parseAddress;
+    import std.string: assumeUTF;
     import std.traits: Unqual;
     import eventcore.core: IOMode;
     import vibe.core.net: TCPConnection, connectTCP, WaitForDataStatus;
     import vibe.core.stream: Stream;
     import vibe.core.sync: TaskCondition, RecursiveTaskMutex, TaskMutex;
-    import vibe.data.json: Json;
+    import vibe.data.json: Json, parseJsonString, serializeToJsonString;
     import vibe.container.ringbuffer: RingBuffer;
+    import vibe.inet.message: parseRFC5322Header;
+    import vibe.inet.url: URL;
     import vibe.internal.interfaceproxy: InterfaceProxy;
+    import vibe.stream.operations: readLine;
+    import vibe.stream.tls: TLSContextKind, createTLSContext, createTLSStream;
 
     public:
 
@@ -60,10 +69,6 @@ final class Nats
 
     this(NatsClientConfig config) @safe
     {
-        import std.algorithm.searching: findSplit, startsWith;
-        import std.format: format;
-        import vibe.inet.url: URL;
-
         immutable ushort defaultPort = 4222;
         uint schemaSkip;
     
@@ -192,7 +197,6 @@ final class Nats
     void publishRequest(T)(scope const(char)[] subject, scope const(T)[] payload, NatsHandler handler) @safe nothrow
         if (is(Unqual!T == ubyte) || is(Unqual!T == char))
     {
-        import std.conv: to;
         auto inboxId = to!string(_msgSent);
         _inboxes[_msgSent] = handler;
         auto replyInbox = _inboxPrefix ~ inboxId;
@@ -282,14 +286,11 @@ final class Nats
 
     void setupNatsConnection() @safe nothrow
     {
-        import vibe.data.json: serializeToJsonString;
-
         char[OUTCMD_BUFSIZE] buffer = void;
         char[] cmd;
 
         _conn.keepAlive(true);
         _conn.tcpNoDelay(true);
-        _natsStream = _conn;
         // send the CONNECT string
         try {
             _conn.readTimeout(10.seconds);
@@ -332,7 +333,6 @@ final class Nats
 
     void connector() @safe nothrow
     {
-        import std.random: uniform;
         auto reconnectTimer = createTimer(null);
         _connectMutex.lock();
         scope(exit) _connectMutex.unlock();
@@ -349,6 +349,13 @@ final class Nats
                             _conn.close();
                         _connState = NatsState.CONNECTING;
                         _conn = connectTCP(_host, _port, null, 0, 5.seconds);
+                        if (_useTls) {
+                            // wrap the TCP connection in a TLS stream
+                            auto tlsContext = createTLSContext(TLSContextKind.client);
+                            _natsStream = createTLSStream(_conn, tlsContext);
+                        } else {
+                            _natsStream = _conn;
+                        }
                     }
                     catch (Exception e) {
                         logWarn("nats.client: Exception whilst attempting connect to Nats server, msg: %s", e.msg);
@@ -398,43 +405,12 @@ final class Nats
     {
         version (NatsClientLogging) logDiagnostic("nats.client: listener task started.");
         try {
-            while(_connState == NatsState.CONNECTING || _connState == NatsState.CONNECTED) {
-                // task blocks here until we receive data. No timeout as that is handled
-                // by the heartbeater task.
-                auto result = _conn.waitForDataEx();
-                if (result == WaitForDataStatus.dataAvailable) {
-                    processNatsStream();
-                    // bool chunkProcessed;
-                    // if (_inBuffer.empty) {
-                    //     // attempt to process directly from TCP socket buffer (zero copy)
-                    //     // size_t consumed = processNatsStream(_conn.peek());
-                    //     size_t consumed = 0;
-                    //     if (consumed) {
-                    //         _conn.skip(consumed);
-                    //         _bytesReceived += consumed;
-                    //         chunkProcessed = true;
-                    //     }
-                    // }
-                    // // add anything remaining in this read to the buffer, and attempt to process
-                    // immutable bytesRead = _conn.read(_inBuffer.peekDst, IOMode.immediate);
-                    // if (bytesRead > 0 && !chunkProcessed) {
-                    //     _bytesReceived += bytesRead;
-                    //     _inBuffer.putBackN(bytesRead);
-                    //     // size_t consumed = processNatsStream(_inBuffer[]);
-                    //     size_t consumed = 0;
-                    //     if (consumed > 0) 
-                    //         _inBuffer.removeFrontN(consumed);
-                    // }
-                }
-                else if (result == WaitForDataStatus.noMoreData) {
-                    throw new Exception("WaitForDataStatus.noMoreData");
-                }
-            }
+            processNatsStream();
         }
         catch (Exception e) {
             logWarn("nats.client: Nats session disconnected! (%s).", e.msg);
-            disconnect();
         }
+        disconnect();
         version (NatsClientLogging)
             logDiagnostic("nats.client: Listener task terminating. Connector will attempt reconnect.");
     }
@@ -551,12 +527,6 @@ final class Nats
 
     void processNatsStream() @safe
     {
-        //import std.algorithm.comparison: min;
-        import std.array: appender;
-        import std.string: assumeUTF;
-        import vibe.stream.operations: readLine;
-        import vibe.inet.message: parseRFC5322Header;
-
         enum maxNatsProtocolLine = 2048;
         enum maxStatusLength = 512;
         auto protocolLine = appender!(ubyte[]);
@@ -566,14 +536,24 @@ final class Nats
         Subscription subscription;
     
         loop:
+        // main message processing loop
         while (_connState == NatsState.CONNECTING || _connState == NatsState.CONNECTED) {
+            // idle loop will block here until data available or socket drops
+            auto result = _conn.waitForDataEx();
+            if (result == WaitForDataStatus.noMoreData) {
+                throw new NatsException("Nats TCP connection lost.");
+            }
+
             Msg msg;
             protocolLine.clear();
             statusLine.clear();
             
             _natsStream.readLine(protocolLine);
+            // skip any blank lines (ie lines with only a CRLF)
+            if (protocolLine[].length == 0) 
+                continue loop;
             version (NatsClientLogging)
-                logTrace("Sending NATS protocol line length %d to parseNats.", protocolLine.length);
+                logTrace("Sending NATS protocol line length %d to parseNats.", protocolLine[].length);
             parseNats(msg, protocolLine[]); 
 
             final switch (msg.type)
@@ -645,8 +625,6 @@ final class Nats
 
     void processServerInfo(scope Msg msg) @safe
     {
-        import vibe.data.json: parseJsonString;
-
         // copy the message payload as we will be retaining it
         string serverjson = msg.payloadAsString.idup;
         _info = parseJsonString(serverjson);
@@ -659,13 +637,10 @@ final class Nats
 
     void inboxHandler(scope Msg msg) @safe nothrow
     {
-        import std.algorithm.searching: findSplitAfter;
-        import std.conv: to;
-        
-        version (NatsClientLogging) 
-            logDebugV("Inbox %s handler called with msg: %s", msg.subject, msg.payloadAsString);
         uint inbox;
         bool badResponse = false;
+        version (NatsClientLogging) 
+            logDebugV("Inbox %s handler called with msg: %s", msg.subject, msg.payloadAsString);
         try {
             auto findInbox = msg.subject.findSplitAfter("_.");
             if (!findInbox) 

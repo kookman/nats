@@ -48,7 +48,7 @@ class Subscription
     bool		closed;
 }
 
-class NatsProtocolException : Exception {
+class NatsException : Exception {
     this(string message, string file = __FILE__, size_t line = __LINE__, Exception next = null) @safe
     {
         super(message, file, line, next);
