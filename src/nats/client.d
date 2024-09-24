@@ -53,8 +53,8 @@ final class Nats
 
     static struct Statistics
     {
-        ulong bytesReceived;
-        ulong bytesSent;
+        ulong payloadBytesReceived;
+        ulong payloadBytesSent;
         ulong msgsReceived;
         ulong msgsSent;
     }
@@ -144,8 +144,8 @@ final class Nats
     {
         Statistics stats;
 
-        stats.bytesReceived = _bytesReceived;
-        stats.bytesSent = _bytesSent;
+        stats.payloadBytesReceived = _payloadBytesReceived;
+        stats.payloadBytesSent = _payloadBytesSent;
         stats.msgsReceived = _msgRecv;
         stats.msgsSent = _msgSent;
         return stats;
@@ -263,8 +263,8 @@ final class Nats
     Task                 _connector;
     Task                 _heartbeater;
     Task                 _listener;
-    ulong                _bytesSent;
-    ulong                _bytesReceived;
+    ulong                _payloadBytesSent;
+    ulong                _payloadBytesReceived;
     uint                 _msgSent;
     uint                 _msgRecv;
     uint                 _pingSent;
@@ -291,6 +291,8 @@ final class Nats
 
         _conn.keepAlive(true);
         _conn.tcpNoDelay(true);
+        // rest _pingSent & _pong Recv to enable flush syncing
+        _pingSent, _pongRecv = 0;
         // send the CONNECT string
         try {
             _conn.readTimeout(10.seconds);
@@ -479,6 +481,7 @@ final class Nats
             scope(exit) _writeMutex.unlock();       
             write(cmd);
             write(payload);
+            _payloadBytesSent += payload.length;
             _msgSent++;
         }
         catch (Exception e) {
@@ -512,15 +515,14 @@ final class Nats
     {
         synchronized(_writeMutex)
         {
-            version (NatsClientLogging) logTrace("nats.client write: %s", () @trusted { return cast(string)buffer; }());            
-            auto bytesWritten = _conn.write(cast(const(ubyte)[]) buffer, IOMode.all);
+            version (NatsClientLogging) logTrace("nats.client buffer write, length: %d", buffer.length);            
+            auto bytesWritten = _natsStream.write(cast(const(ubyte)[]) buffer, IOMode.all);
             // nats protocol requires all writes to be separated by CRLF
-            bytesWritten += _conn.write(CRLF, IOMode.all);
+            bytesWritten += _natsStream.write(CRLF, IOMode.all);
             if (bytesWritten != buffer.length + 2)
             {
                 logError("nats.client: Error writing to Nats connection! Socket write error.");
             }
-            _bytesSent += bytesWritten;
         }
     }
 
@@ -580,6 +582,7 @@ final class Nats
                     }
                     msg.payload = _payloadBuffer[0 .. expectedPayload];
                     _msgRecv++;
+                    _payloadBytesReceived += expectedPayload;
                     subscription = _subs[msg.sid];
                     subscription.msgsReceived++;
                     subscription.bytesReceived += expectedPayload;
