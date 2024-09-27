@@ -16,20 +16,20 @@ else version = NatsClientLogging;
 
 final class Nats
 {
+    import std.algorithm.comparison: min;
     import std.algorithm.searching: findSplit, findSplitAfter, startsWith;
-    import std.array: appender;
+    import std.array: appender, Appender;
     import std.conv: to;
-    import std.format: format, sformat;
+    import std.format: format, formattedWrite;
     import std.random: uniform;
     import std.socket: Address, parseAddress;
-    import std.string: assumeUTF;
+    import std.string: assumeUTF, representation;
     import std.traits: Unqual;
     import eventcore.core: IOMode;
     import vibe.core.net: TCPConnection, connectTCP, WaitForDataStatus;
     import vibe.core.stream: Stream;
     import vibe.core.sync: TaskCondition, RecursiveTaskMutex, TaskMutex;
     import vibe.data.json: Json, parseJsonString, serializeToJsonString;
-    import vibe.container.ringbuffer: RingBuffer;
     import vibe.inet.message: parseRFC5322Header;
     import vibe.inet.url: URL;
     import vibe.internal.interfaceproxy: InterfaceProxy;
@@ -69,7 +69,7 @@ final class Nats
 
     this(NatsClientConfig config) @safe
     {
-        immutable ushort defaultPort = 4222;
+        enum ushort defaultPort = 4222;
         uint schemaSkip;
     
         if (config.natsUri.startsWith("nats:"))
@@ -102,8 +102,8 @@ final class Nats
         _flushSync = new TaskCondition(_flushMutex);
         // reserve a sensible minimum amount of space for new subscriptions
         _subs.reserve(16);
-        // setup initial buffer size
-        _outBuffer.capacity = 64 * 1024;
+        // setup initial outbound NATS buffer size
+        _outBuffer.reserve(64 * 1024);
     }
 
     unittest
@@ -170,20 +170,17 @@ final class Nats
 
     void unsubscribe(Subscription s, uint msgsToDrain = 0) @safe
     {
-        char[OUTCMD_BUFSIZE] buffer = void;
-        char[] cmd;
-
         if (msgsToDrain > 0)
         {
             s.msgsToExpire = s.msgsReceived + msgsToDrain;
-            cmd = buffer.sformat!"UNSUB %s %s"(s.sid, msgsToDrain);			
+            _outBuffer.formattedWrite!"UNSUB %s %s\r\n"(s.sid, msgsToDrain);			
         }
         else
         {
             s.closed = true;
-            cmd = buffer.sformat!"UNSUB %s"(s.sid);			
+            _outBuffer.formattedWrite!"UNSUB %s\r\n"(s.sid);			
         }
-        write(cmd);
+        send();
     }
 
 
@@ -211,7 +208,7 @@ final class Nats
         
         auto start = MonoTime.currTime();
         try 
-            write(PING);
+            write("PING\r\n");
         catch (Exception e) {
             logError("nats.client: Flush write error (%s)", e.msg);
             disconnect();
@@ -281,25 +278,22 @@ final class Nats
     string               _inboxPrefix;
     NatsHandler[uint]    _inboxes;
     ubyte[]              _payloadBuffer;
-    RingBuffer!ubyte     _outBuffer;
+    Appender!(ubyte[])   _outBuffer;
 
 
     void setupNatsConnection() @safe nothrow
     {
-        char[OUTCMD_BUFSIZE] buffer = void;
-        char[] cmd;
-
         _conn.keepAlive(true);
         _conn.tcpNoDelay(true);
-        // rest _pingSent & _pong Recv to enable flush syncing
+        // reset _pingSent & _pong Recv to enable flush syncing
         _pingSent, _pongRecv = 0;
         // send the CONNECT string
         try {
             _conn.readTimeout(10.seconds);
-            cmd = buffer.sformat("CONNECT %s", serializeToJsonString(_connectInfo));
+            _outBuffer.formattedWrite("CONNECT %s\r\n", serializeToJsonString(_connectInfo));
             version (NatsClientLogging)
-                logDebug("nats.client: Socket connected. Sending: %s", cmd);
-            write(cmd);
+                logDebug("nats.client: Socket connected. Sending: %s", _outBuffer[].assumeUTF);
+            send();
         }
         catch (Exception e) {
             logError("nats.client: Failed to send initial CONNECT string (%s).", e.msg);
@@ -470,56 +464,91 @@ final class Nats
     void sendPublish(T)(scope const(char)[] subject, scope const(T)[] payload, 
                             scope const(char)[] replySubject = null) @safe nothrow
         if (is(Unqual!T == ubyte) || is(Unqual!T == char))
+    // fixme: to allow for 
     {
-        char[OUTCMD_BUFSIZE] buffer = void;
-        char[] cmd;
-    
-        try {
-            cmd = buffer.sformat!"PUB %s %s %s"(subject, replySubject, payload.length);
-            // ensure we don't interleave other writes between writing PUB command & payload
-            _writeMutex.lock();
-            scope(exit) _writeMutex.unlock();       
-            write(cmd);
-            write(payload);
-            _payloadBytesSent += payload.length;
-            _msgSent++;
+        try
+            if (replySubject.length)
+                _outBuffer.formattedWrite!"PUB %s %s %s\r\n"(subject, replySubject, payload.length);
+            else
+                _outBuffer.formattedWrite!"PUB %s %s\r\n"(subject, payload.length);
+        catch (Exception e)
+            logError("nats.client: Exception writing PUB cmd to output buffer. (%s)", e.msg);
+        if (payload.length + 2 < _outBuffer.capacity) {
+            static if (is(Unqual!T == char))
+                _outBuffer ~= payload.representation;
+            else
+                _outBuffer ~= payload;
+            _outBuffer ~= CRLF;
+            send();
+        } else {
+            try {
+                // ensure we don't interleave other writes between writing PUB command & payload
+                _writeMutex.lock();
+                scope(exit) _writeMutex.unlock();
+                send();
+                write(payload);
+                write(CRLF);
+            }       
+            catch (Exception e) {
+                logError("nats.client: Publish failed (%s)", e.msg);
+                disconnect();
+            }
         }
-        catch (Exception e) {
-            logError("nats.client: Publish failed (%s), command (%s)", e.msg, cmd);
-            disconnect();
-        }
+        _payloadBytesSent += payload.length;
+        _msgSent++;
     }
 
 
     void sendSubscribe(Subscription s) @safe nothrow
     {
-        char[OUTCMD_BUFSIZE] buffer = void;
-        char[] cmd;
-
         try {
             if (s.queueGroup)
-                cmd = buffer.sformat!"SUB %s %s %s"(s.subject, s.queueGroup, s.sid);
+                _outBuffer.formattedWrite!"SUB %s %s %s\r\n"(s.subject, s.queueGroup, s.sid);
             else
-                cmd = buffer.sformat!"SUB %s %s"(s.subject, s.sid);
-            write(cmd);
+                _outBuffer.formattedWrite!"SUB %s %s\r\n"(s.subject, s.sid);
         }
         catch (Exception e) {
-            logError("nats.client: Error (%s) subscribing on (%s)", e.msg, s.subject);
-            disconnect();
+            logError("nats.client: Error writing SUB command to output buffer. (%s)", e.msg);
+        }
+        send();
+    }
+
+
+    /// Send the accumulated message(s) in the outbound buffer immediately to the stream
+    void send() @safe nothrow
+    {
+        ulong bytesWritten, bufferLen;
+        try {
+            synchronized(_writeMutex) {
+                bufferLen = _outBuffer[].length;
+                version (NatsClientLogging)
+                    logTrace("nats.client outBuffer send, length: %d, snippet: %s ...", 
+                            bufferLen, _outBuffer[].assumeUTF[0 .. min(100, bufferLen)]);
+                bytesWritten = _natsStream.write(_outBuffer[], IOMode.all);
+            }
+        }
+        catch (Exception e)
+            logError("nats.client: Stream write failed (%s)", e.msg);
+        _outBuffer.clear();
+        if (bytesWritten != bufferLen)
+        {
+            logError("nats.client: Error writing to Nats stream. Expected to write %d bytes, wrote %d.");
         }
     }
 
 
-    void write(T)(scope const(T)[] buffer) @safe 
-        if (is(Unqual!T == ubyte) || is(Unqual!T == char))
+    /// Write a buffer of bytes immediately to the stream
+    void write(T)(scope const(T)[] buffer) @safe
+        if (is(Unqual!T == char) || is(Unqual!T == ubyte))
     {
         synchronized(_writeMutex)
         {
-            version (NatsClientLogging) logTrace("nats.client buffer write, length: %d", buffer.length);            
-            auto bytesWritten = _natsStream.write(cast(const(ubyte)[]) buffer, IOMode.all);
-            // nats protocol requires all writes to be separated by CRLF
-            bytesWritten += _natsStream.write(CRLF, IOMode.all);
-            if (bytesWritten != buffer.length + 2)
+            version (NatsClientLogging) logTrace("nats.client stream write, length: %d", buffer.length);
+            static if (is(Unqual!T == char))
+                auto bytesWritten = _natsStream.write(buffer.representation, IOMode.all);
+            else
+                auto bytesWritten = _natsStream.write(buffer, IOMode.all);
+            if (bytesWritten != buffer.length)
             {
                 logError("nats.client: Error writing to Nats connection! Socket write error.");
             }
@@ -599,7 +628,7 @@ final class Nats
                     continue loop;
                 
                 case NatsResponse.PING:
-                    write(PONG);
+                    write("PONG\r\n");
                     _pongSent++;
                     version (NatsClientLogging) logDebugV("Pong sent.");
                     continue loop;
