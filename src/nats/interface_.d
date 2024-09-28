@@ -59,9 +59,14 @@ struct NatsClientConfig
 {
     string      natsUri;
     string      clientId;
-    Duration    heartbeatInterval = 5.seconds;
+    Duration    heartbeatInterval = 15.seconds;
     Duration    reconnectInterval = 15.seconds;
     Duration    connectTimeout = 15.seconds;
+    version(linux) {
+        string caCertificateFile = "/etc/ssl/certs/ca-certificates.crt";
+    } else {
+        string caCertificateFile;
+    }
 }
 
 enum NatsState : byte { INIT, CONNECTING, CONNECTED, DISCONNECTED, RECONNECTING, CLOSED }

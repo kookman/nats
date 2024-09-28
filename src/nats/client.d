@@ -72,17 +72,14 @@ final class Nats
         enum ushort defaultPort = 4222;
         uint schemaSkip;
     
-        if (config.natsUri.startsWith("nats:"))
-        {
+        _config = config; 
+        if (config.natsUri.startsWith("nats:")) {
             _useTls = false;
             schemaSkip = 4;
-        }
-        else if (config.natsUri.startsWith("tls:"))
-        {
+        } else if (config.natsUri.startsWith("tls:")) {
             _useTls = true;
             schemaSkip = 3;
         }
-
         string uri = schemaSkip ? format!"tcp%s"(config.natsUri[schemaSkip..$]) : config.natsUri;
         auto immutable url = URL(uri);
 
@@ -91,9 +88,6 @@ final class Nats
         _connectInfo.pass = url.password;
         _host = url.host;
         _port = (url.port == 0) ? defaultPort : url.port;
-        _heartbeatInterval = config.heartbeatInterval;
-        _reconnectInterval = config.reconnectInterval;
-        _connectTimeout = config.connectTimeout;
 
         _connectMutex = new TaskMutex;
         _connStateChange = new TaskCondition(_connectMutex);
@@ -246,6 +240,7 @@ final class Nats
 
     enum OUTCMD_BUFSIZE = 256;
 
+    NatsClientConfig     _config;
     TCPConnection 		 _conn;
     InterfaceProxy!Stream _natsStream;
     RecursiveTaskMutex	 _writeMutex;
@@ -254,9 +249,6 @@ final class Nats
     TaskMutex 			 _flushMutex;
     TaskCondition   	 _flushSync;
     Duration 			 _lastFlushRTT;
-    Duration			 _heartbeatInterval;
-    Duration             _reconnectInterval;
-    Duration             _connectTimeout;
     Task                 _connector;
     Task                 _heartbeater;
     Task                 _listener;
@@ -329,7 +321,10 @@ final class Nats
 
     void connector() @safe nothrow
     {
+        Msg msg;
         auto reconnectTimer = createTimer(null);
+        auto infoLine = appender!(ubyte[]);
+
         _connectMutex.lock();
         scope(exit) _connectMutex.unlock();
         
@@ -344,13 +339,16 @@ final class Nats
                         if (_conn.connected)
                             _conn.close();
                         _connState = NatsState.CONNECTING;
-                        _conn = connectTCP(_host, _port, null, 0, 5.seconds);
-                        if (_useTls) {
-                            // wrap the TCP connection in a TLS stream
-                            auto tlsContext = createTLSContext(TLSContextKind.client);
-                            _natsStream = createTLSStream(_conn, tlsContext);
+                        _conn = connectTCP(_host, _port, null, 0, _config.connectTimeout);
+                        _conn.readLine(infoLine);
+                        parseNats(msg, infoLine[]);
+                        if (msg.type == NatsResponse.INFO) {
+                            version (NatsClientLogging) logDebug("nats.client Connector: Server INFO msg: %s", 
+                                    msg.payloadAsString);
+                            processServerInfo(msg);
                         } else {
-                            _natsStream = _conn;
+                            logWarn("nats.client Connector: Expected INFO msg, got: %s", infoLine[].assumeUTF);
+                            _connState = NatsState.DISCONNECTED;
                         }
                     }
                     catch (Exception e) {
@@ -369,9 +367,10 @@ final class Nats
                     break;                   
 
                 case NatsState.DISCONNECTED:
-                    // wait for an interval + random extra delay to avoid thundering herd on Nats server down
                     try {
-                        Duration delay = _reconnectInterval + uniform(0, 1000).msecs;
+                        Duration delay = _config.reconnectInterval; 
+                        // random extra delay to avoid thundering herd on Nats server down
+                        delay += _useTls ? uniform(500, 2000).msecs : uniform(0, 1000).msecs;
                         logInfo("nats.client: Waiting %s before attempting reconnect.", delay);
                         reconnectTimer.rearm(delay, false);
                         reconnectTimer.wait();
@@ -439,7 +438,7 @@ final class Nats
         while(_connState == NatsState.CONNECTED) {
             auto prevSent = _msgSent + _pingSent;
             auto prevRecv = _msgRecv + _pingRecv;
-            timer.rearm(_heartbeatInterval, false);
+            timer.rearm(_config.heartbeatInterval, false);
             try
                 timer.wait();
             catch (Exception e) {
@@ -449,10 +448,12 @@ final class Nats
             if (_msgSent + _pingSent == prevSent && _msgRecv + _pingRecv == prevRecv
                     && _connState == NatsState.CONNECTED) {
                 version (NatsClientLogging) 
-                    logDebugV("nats.client: Nats connection idle for %s. Sending heartbeat.", _heartbeatInterval);
+                    logDebugV("nats.client: Nats connection idle for %s. Sending heartbeat.", 
+                            _config.heartbeatInterval);
                 runTask(&heartbeat);
             } else if (flushPending) {
-                logError("nats.client: Heartbeat did not return within heartbeat interval (%s).", _heartbeatInterval);
+                logError("nats.client: Heartbeat did not return within heartbeat interval (%s).",
+                        _config.heartbeatInterval);
                 disconnect();
             }
         }
@@ -568,7 +569,7 @@ final class Nats
     
         loop:
         // main message processing loop
-        while (_connState == NatsState.CONNECTING || _connState == NatsState.CONNECTED) {
+        while (_connState == NatsState.CONNECTED) {
             // idle loop will block here until data available or socket drops
             auto result = _conn.waitForDataEx();
             if (result == WaitForDataStatus.noMoreData) {
@@ -630,7 +631,7 @@ final class Nats
                 case NatsResponse.PING:
                     write("PONG\r\n");
                     _pongSent++;
-                    version (NatsClientLogging) logDebugV("Pong sent.");
+                    version (NatsClientLogging) logDebugV("nats.client: Pong sent.");
                     continue loop;
                 
                 case NatsResponse.PONG:
@@ -640,12 +641,11 @@ final class Nats
                     continue loop;
 
                 case NatsResponse.OK:
-                    version (NatsClientLogging) logDebug("Nats Ok received.");
+                    version (NatsClientLogging) logDebug("nats.client: Nats Ok received.");
                     continue loop;
 
                 case NatsResponse.INFO:
-                    version (NatsClientLogging) logDebug("Server INFO msg: %s", msg.payloadAsString);
-                    processServerInfo(msg);
+                    logWarn("nats.client: Ignoring unexpected server INFO msg: %s", msg.payloadAsString);
                     continue loop;
 
                 case NatsResponse.ERR:
@@ -660,6 +660,17 @@ final class Nats
         // copy the message payload as we will be retaining it
         string serverjson = msg.payloadAsString.idup;
         _info = parseJsonString(serverjson);
+        // check if we need to switch to TLS
+        _useTls = _info["tls_required"].get!bool;
+        if (_useTls) {
+            // if so, wrap the TCP connection in a TLS stream
+            auto tlsContext = createTLSContext(TLSContextKind.client);
+            if (_config.caCertificateFile)
+                tlsContext.useTrustedCertificateFile(_config.caCertificateFile);
+            _natsStream = createTLSStream(_conn, tlsContext, _host);
+        } else {
+            _natsStream = _conn;
+        }
         // allocate the payload buffer according to largest allowed
         ulong maxPayloadSize = _info["max_payload"].get!ulong;
         if (maxPayloadSize > _payloadBuffer.length) {
@@ -672,7 +683,7 @@ final class Nats
         uint inbox;
         bool badResponse = false;
         version (NatsClientLogging) 
-            logDebugV("Inbox %s handler called with msg: %s", msg.subject, msg.payloadAsString);
+            logDebugV("nats.client: Inbox %s handler called with msg: %s", msg.subject, msg.payloadAsString);
         try {
             auto findInbox = msg.subject.findSplitAfter("_.");
             if (!findInbox) 
