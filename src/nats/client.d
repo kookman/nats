@@ -25,6 +25,7 @@ final class Nats
     import std.socket: Address, parseAddress;
     import std.string: assumeUTF, representation;
     import std.traits: Unqual;
+    import std.typecons: Flag, Yes, No;
     import eventcore.core: IOMode;
     import vibe.core.net: TCPConnection, connectTCP, WaitForDataStatus;
     import vibe.core.stream: Stream;
@@ -195,14 +196,14 @@ final class Nats
     }
 
 
-    Duration flush(Duration timeout = 5.seconds) @safe nothrow
+    Duration flush(Duration timeout = 5.seconds, Flag!"isConnector" isConnector = No.isConnector) @safe nothrow
     {
         _flushMutex.lock();
         scope(exit) _flushMutex.unlock();
         
         auto start = MonoTime.currTime();
         try 
-            write("PING\r\n");
+            write("PING\r\n", isConnector);
         catch (Exception e) {
             logError("nats.client: Flush write error (%s)", e.msg);
             disconnect();
@@ -285,13 +286,14 @@ final class Nats
             _outBuffer.formattedWrite("CONNECT %s\r\n", serializeToJsonString(_connectInfo));
             version (NatsClientLogging)
                 logDebug("nats.client: Socket connected. Sending: %s", _outBuffer[].assumeUTF);
-            send();
+            send(Yes.isConnector);
         }
         catch (Exception e) {
             logError("nats.client: Failed to send initial CONNECT string (%s).", e.msg);
             return;
         }
-        auto rtt = flush();
+        auto rtt = flush(2.seconds, Yes.isConnector);
+        _connState = NatsState.CONNECTED;
         version (NatsClientLogging)
             logDebug("nats.client: Flush roundtrip (%s) completed.", rtt);
         // create a connection specific inbox subscription
@@ -316,7 +318,6 @@ final class Nats
                 if (!priorSubscription.closed) sendSubscribe(priorSubscription);
             }
         }
-        _connState = NatsState.CONNECTED;
     }
 
     void connector() @safe nothrow
@@ -360,6 +361,7 @@ final class Nats
                     if (_conn.connected) {
                         _listener = runTask(&listener);
                         setupNatsConnection();
+                        _connStateChange.notify();
                     } else {
                         logWarn("nats.client Connector: Connection attempt to %s failed.", _host);
                         _connState = NatsState.DISCONNECTED;
@@ -515,44 +517,44 @@ final class Nats
     }
 
 
-    /// Send the accumulated message(s) in the outbound buffer immediately to the stream
-    void send() @safe nothrow
+    /// Send the accumulated message(s) in the outbound buffer to the stream
+    void send(Flag!"isConnector" isConnector = No.isConnector) @safe nothrow
     {
-        ulong bytesWritten, bufferLen;
-        try {
-            synchronized(_writeMutex) {
-                bufferLen = _outBuffer[].length;
-                version (NatsClientLogging)
-                    logTrace("nats.client outBuffer send, length: %d, snippet: %s ...", 
-                            bufferLen, _outBuffer[].assumeUTF[0 .. min(100, bufferLen)]);
-                bytesWritten = _natsStream.write(_outBuffer[], IOMode.all);
-            }
+        version (NatsClientLogging) {
+            auto bufferLen = _outBuffer[].length;
+            logTrace("nats.client outBuffer send, length: %d, snippet: %s ...", 
+                    bufferLen, _outBuffer[].assumeUTF[0 .. min(100, bufferLen)]);
         }
-        catch (Exception e)
-            logError("nats.client: Stream write failed (%s)", e.msg);
+        write(_outBuffer[], isConnector);
         _outBuffer.clear();
-        if (bytesWritten != bufferLen)
-        {
-            logError("nats.client: Error writing to Nats stream. Expected to write %d bytes, wrote %d.");
-        }
     }
 
 
-    /// Write a buffer of bytes immediately to the stream
-    void write(T)(scope const(T)[] buffer) @safe
+    /// Write a buffer of bytes to the stream
+    void write(T)(scope const(T)[] buffer, Flag!"isConnector" isConnector = No.isConnector) @safe nothrow
         if (is(Unqual!T == char) || is(Unqual!T == ubyte))
     {
-        synchronized(_writeMutex)
-        {
-            version (NatsClientLogging) logTrace("nats.client stream write, length: %d", buffer.length);
-            static if (is(Unqual!T == char))
-                auto bytesWritten = _natsStream.write(buffer.representation, IOMode.all);
-            else
-                auto bytesWritten = _natsStream.write(buffer, IOMode.all);
-            if (bytesWritten != buffer.length)
+        ulong bytesWritten;
+        // block here and wait for connection, unless it is the connector task trying to write
+        while (!isConnector && !connected) {
+            logWarn("nats.client: Write task blocked waiting for connection (%s)", _connState);
+            _connStateChange.wait();
+        }
+        try {
+            synchronized(_writeMutex)
             {
-                logError("nats.client: Error writing to Nats connection! Socket write error.");
+                version (NatsClientLogging) logTrace("nats.client stream write, length: %d", buffer.length);
+                static if (is(Unqual!T == char))
+                    bytesWritten = _natsStream.write(buffer.representation, IOMode.all);
+                else
+                    bytesWritten = _natsStream.write(buffer, IOMode.all);
             }
+        }
+        catch (Exception e)
+            logError("nats.client: Exception writing to Nats stream (%s).", e.msg);          
+        if (bytesWritten != buffer.length)
+        {
+            logError("nats.client: Error writing to Nats stream. Expected to write %d bytes, wrote %d.");
         }
     }
 
@@ -569,7 +571,7 @@ final class Nats
     
         loop:
         // main message processing loop
-        while (_connState == NatsState.CONNECTED) {
+        while (connected || _connState == NatsState.CONNECTING) {
             // idle loop will block here until data available or socket drops
             auto result = _conn.waitForDataEx();
             if (result == WaitForDataStatus.noMoreData) {
