@@ -172,7 +172,7 @@ final class Nats
 
 
     Subscription subscribe(string subject, NatsHandler handler, 
-        string queueGroup = null) @safe
+        string queueGroup = null) @safe nothrow
     {
         Subscription s;
 
@@ -187,19 +187,23 @@ final class Nats
     }
 
 
-    void unsubscribe(Subscription s, uint msgsToDrain = 0) @safe
+    void unsubscribe(Subscription s, uint msgsToDrain = 0) @safe nothrow
     {
-        if (msgsToDrain > 0)
-        {
-            s.msgsToExpire = s.msgsReceived + msgsToDrain;
-            _outBuffer.formattedWrite!"UNSUB %s %s\r\n"(s.sid, msgsToDrain);			
+        try {
+            if (msgsToDrain > 0)
+            {
+                s.msgsToExpire = s.msgsReceived + msgsToDrain;
+                _outBuffer.formattedWrite!"UNSUB %s %s\r\n"(s.sid, msgsToDrain);			
+            }
+            else
+            {
+                s.closed = true;
+                _outBuffer.formattedWrite!"UNSUB %s\r\n"(s.sid);			
+            }
+            send();
         }
-        else
-        {
-            s.closed = true;
-            _outBuffer.formattedWrite!"UNSUB %s\r\n"(s.sid);			
-        }
-        send();
+        catch (Exception e)
+            logError("nats.client: Exception writing UNSUB cmd to output buffer. (%s)", e.msg);
     }
 
 
@@ -229,26 +233,43 @@ final class Nats
 
     void disconnect() @safe nothrow
     {
-        logWarn("nats.client: Disconnecting from Nats.");
-        setState(NatsState.DISCONNECTED);
+        if (getState() != NatsState.CLOSED) {
+            logWarn("nats.client: Disconnecting from Nats.");
+            setState(NatsState.DISCONNECTED);
+        }
     }
 
 
     void close() @safe nothrow
     {
-        logInfo("nats.client: Closing TCP connection to Nats server.");
+        logInfo("nats.client: Permanently closing the connection to Nats server.");
+        setState(NatsState.CLOSED);
         try {
-            setState(NatsState.CLOSED);
-            _conn.close();
+            _heartbeater.interrupt();
+        }
+        catch (Exception e) {}
+    }
+
+
+    void waitForClose() @safe nothrow
+    {
+        try {
+            synchronized (_connectMutex) {
+                while (_connState != NatsState.CLOSED) {
+                    logWarn("nats.client: Task blocked waiting for Nats connection to close (%s)", _connState);
+                    _connStateChange.wait();
+                }
+            }
+            _connector.join();
+            _listener.join();
         }
         catch (Exception e) {
-            logError("nats.client: Error (%s) closing TCP connection!");
+            logError("nats.client: Exception while waiting for Nats connection to close (%s)", e.msg);
         }
     }
 
-    private:
 
-    enum OUTCMD_BUFSIZE = 256;
+    private:
 
     NatsClientConfig     _config;
     TCPConnection 		 _conn;
@@ -439,6 +460,12 @@ final class Nats
                     break;
 
                 case NatsState.CLOSED:
+                    try {
+                        if (_conn.connected)
+                            _conn.close();
+                    }
+                    catch (Exception e)
+                            logError("nats.client: Error (%s) closing TCP connection!");
                     break connector;
             }
         }
@@ -448,16 +475,17 @@ final class Nats
 
     void listener() @safe nothrow
     {
-        version (NatsClientLogging) logDiagnostic("nats.client: listener task started.");
+        version (NatsClientLogging) logDiagnostic("nats.client: Nats listener task started.");
         try {
             processNatsStream();
         }
         catch (Exception e) {
-            logWarn("nats.client: Nats session disconnected! (%s).", e.msg);
+            if (getState() != NatsState.CLOSED) 
+                logWarn("nats.client: Nats session disconnected! (%s).", e.msg);
         }
-        disconnect();
         version (NatsClientLogging)
-            logDiagnostic("nats.client: Listener task terminating. Connector will attempt reconnect.");
+            logDiagnostic("nats.client: Nats listener task terminating.");
+        disconnect();
     }
 
 
@@ -484,7 +512,8 @@ final class Nats
             try
                 timer.wait();
             catch (Exception e) {
-                logWarn("nats.client: Heartbeat timer interrupted.");
+                if (getState() != NatsState.CLOSED) 
+                    logWarn("nats.client: Heartbeat timer interrupted.");
                 break;
             }
             if (_msgSent + _pingSent == prevSent && _msgRecv + _pingRecv == prevRecv && connected) {
@@ -499,7 +528,7 @@ final class Nats
             }
         }
         version (NatsClientLogging)
-            logDiagnostic("nats.client: Nats session not connected! Heartbeater task terminating.");
+            logDiagnostic("nats.client: Nats session no longer connected. Heartbeater task terminating.");
     }
 
 
@@ -669,7 +698,7 @@ final class Nats
                 case NatsResponse.PING:
                     write("PONG\r\n", No.wait);
                     _pongSent++;
-                    version (NatsClientLogging) logDebugV("nats.client: Pong sent.");
+                    version (NatsClientLogging) logDebugV("nats.client: Nats server ping received. Pong sent.");
                     continue loop;
                 
                 case NatsResponse.PONG:
