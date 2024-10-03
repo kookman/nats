@@ -125,9 +125,33 @@ final class Nats
 
     bool connected() @safe const nothrow
     {
-        return (_connState == NatsState.CONNECTED);
+        return getState() == NatsState.CONNECTED;
     }
 
+    NatsState getState() @safe const nothrow
+    {
+        NatsState state;
+        try {
+            synchronized (_connectMutex) state = _connState;
+        }
+        catch (Exception e) {}
+        return state;
+    }
+
+    void waitForConnection() @safe nothrow
+    {
+        try {
+            synchronized (_connectMutex) {
+                while (_connState != NatsState.CONNECTED) {
+                    logWarn("nats.client: Task blocked waiting for connection (%s)", _connState);
+                    _connStateChange.wait();
+                }
+            }
+        }
+        catch (Exception e) {
+            logError("nats.client: Exception while waiting for connection (%s)", e.msg);
+        }
+    }
 
     const(Subscription[]) subscriptions() @safe const nothrow
     {
@@ -181,7 +205,7 @@ final class Nats
 
     void publish(T)(scope const(char)[] subject, scope const(T)[] payload) @safe nothrow
         if (is(Unqual!T == ubyte) || is(Unqual!T == char))
-   {
+    {
         sendPublish(subject, payload);
     }
 
@@ -196,44 +220,29 @@ final class Nats
     }
 
 
-    Duration flush(Duration timeout = 5.seconds, Flag!"isConnector" isConnector = No.isConnector) @safe nothrow
+    /// flush all pending writes and wait (maximum period `timeout`) for acknowledgement from Nats server.
+    Duration flush(Duration timeout = 5.seconds) @safe nothrow
     {
-        _flushMutex.lock();
-        scope(exit) _flushMutex.unlock();
-        
-        auto start = MonoTime.currTime();
-        try 
-            write("PING\r\n", isConnector);
-        catch (Exception e) {
-            logError("nats.client: Flush write error (%s)", e.msg);
-            disconnect();
-        }
-        _pingSent++;
-        _flushSync.wait();
-        _lastFlushRTT = MonoTime.currTime() - start;
-        return _lastFlushRTT;
+        return flush(timeout, Yes.wait);
     }
+    
 
     void disconnect() @safe nothrow
     {
-        if (_connState != NatsState.DISCONNECTED) {
-            logWarn("nats.client: Disconnecting from Nats.");
-            _connState = NatsState.DISCONNECTED;
-            _connStateChange.notify();
-        }
+        logWarn("nats.client: Disconnecting from Nats.");
+        setState(NatsState.DISCONNECTED);
     }
+
 
     void close() @safe nothrow
     {
-        if (_connState != NatsState.CLOSED) {
-            logInfo("nats.client: Closing TCP connection to Nats server.");
-            try 
-                _conn.close();
-            catch (Exception e) {
-                logError("nats.client: Error (%s) closing TCP connection!");
-            }
-            _connState = NatsState.CLOSED;
-            _connStateChange.notify();
+        logInfo("nats.client: Closing TCP connection to Nats server.");
+        try {
+            setState(NatsState.CLOSED);
+            _conn.close();
+        }
+        catch (Exception e) {
+            logError("nats.client: Error (%s) closing TCP connection!");
         }
     }
 
@@ -274,6 +283,45 @@ final class Nats
     Appender!(ubyte[])   _outBuffer;
 
 
+    void setState(NatsState desiredState, Flag!"notify" notify = Yes.notify) @safe nothrow
+    {
+        try {
+            synchronized (_connectMutex) _connState = desiredState;
+        }
+        catch (Exception e) {}
+        if (notify)
+            _connStateChange.notifyAll();
+    }
+
+
+    Duration flush(Duration timeout = 5.seconds, Flag!"wait" wait) @safe nothrow
+    {
+        auto start = MonoTime.currTime();
+        try {
+            synchronized (_flushMutex) {
+                try {
+                    if (wait == No.wait) 
+                        write("PING\r\n", No.wait);
+                    else {
+                        _outBuffer ~= "PING\r\n".representation;
+                        send();
+                    }
+                }
+                catch (Exception e) {
+                    logError("nats.client: Flush write error (%s)", e.msg);
+                    disconnect();
+                }
+                _pingSent++;
+                logTrace("entering wait for flush sync...");
+                _flushSync.wait();
+            }
+        }
+        catch (Exception e) {}
+        _lastFlushRTT = MonoTime.currTime() - start;
+        return _lastFlushRTT;
+    }
+
+
     void setupNatsConnection() @safe nothrow
     {
         _conn.keepAlive(true);
@@ -283,19 +331,21 @@ final class Nats
         // send the CONNECT string
         try {
             _conn.readTimeout(10.seconds);
-            _outBuffer.formattedWrite("CONNECT %s\r\n", serializeToJsonString(_connectInfo));
+            auto connectCmd = appender!(char[]);
+            connectCmd.formattedWrite("CONNECT %s\r\n", serializeToJsonString(_connectInfo));
             version (NatsClientLogging)
-                logDebug("nats.client: Socket connected. Sending: %s", _outBuffer[].assumeUTF);
-            send(Yes.isConnector);
+                logDebug("nats.client: Socket connected. Sending: %s", connectCmd[]);
+            write(connectCmd[], No.wait);
         }
         catch (Exception e) {
             logError("nats.client: Failed to send initial CONNECT string (%s).", e.msg);
             return;
         }
-        auto rtt = flush(2.seconds, Yes.isConnector);
-        _connState = NatsState.CONNECTED;
+        auto rtt = flush(2.seconds, No.wait);
         version (NatsClientLogging)
             logDebug("nats.client: Flush roundtrip (%s) completed.", rtt);
+        setState(NatsState.CONNECTED);
+
         // create a connection specific inbox subscription
         _inboxPrefix = "_INBOX_" ~ _conn.localAddress.toString() ~ "_.";
         auto inbox = new Subscription;
@@ -326,12 +376,9 @@ final class Nats
         auto reconnectTimer = createTimer(null);
         auto infoLine = appender!(ubyte[]);
 
-        _connectMutex.lock();
-        scope(exit) _connectMutex.unlock();
-        
         connector:
-        while (_connState != NatsState.CLOSED) {
-            final switch (_connState) {
+        while (true) {
+            final switch (getState()) {
                 case NatsState.INIT:
                 case NatsState.RECONNECTING:
                     version (NatsClientLogging) logDiagnostic(
@@ -339,8 +386,8 @@ final class Nats
                     try {
                         if (_conn.connected)
                             _conn.close();
-                        _connState = NatsState.CONNECTING;
                         _conn = connectTCP(_host, _port, null, 0, _config.connectTimeout);
+                        setState(NatsState.CONNECTING, No.notify);
                         _conn.readLine(infoLine);
                         parseNats(msg, infoLine[]);
                         if (msg.type == NatsResponse.INFO) {
@@ -349,7 +396,7 @@ final class Nats
                             processServerInfo(msg);
                         } else {
                             logWarn("nats.client Connector: Expected INFO msg, got: %s", infoLine[].assumeUTF);
-                            _connState = NatsState.DISCONNECTED;
+                            setState(NatsState.DISCONNECTED);
                         }
                     }
                     catch (Exception e) {
@@ -361,10 +408,9 @@ final class Nats
                     if (_conn.connected) {
                         _listener = runTask(&listener);
                         setupNatsConnection();
-                        _connStateChange.notify();
                     } else {
                         logWarn("nats.client Connector: Connection attempt to %s failed.", _host);
-                        _connState = NatsState.DISCONNECTED;
+                        setState(NatsState.DISCONNECTED, No.notify);
                     }
                     break;                   
 
@@ -376,18 +422,20 @@ final class Nats
                         logInfo("nats.client: Waiting %s before attempting reconnect.", delay);
                         reconnectTimer.rearm(delay, false);
                         reconnectTimer.wait();
+                        setState(NatsState.RECONNECTING);
                     }
                     catch (Exception e) {
                         logWarn("nats.client: Reconnect timer interrupted.");
                         break;
                     }
-                    _connState = NatsState.RECONNECTING;
                     break;
 
                 case NatsState.CONNECTED:
                     logInfo("nats.client: Nats connection ready.");
                     _heartbeater = runTask(&heartbeater);
-                    _connStateChange.wait();
+                    try
+                        synchronized (_connectMutex) _connStateChange.wait();
+                    catch (Exception e) {}
                     break;
 
                 case NatsState.CLOSED:
@@ -424,20 +472,12 @@ final class Nats
         {
             flushPending = true;
             scope(exit) flushPending = false;
-            auto t = runTask(() @safe nothrow {
-                auto rtt = flush();
-                version (NatsClientLogging)
-                    logDebug("nats.client: Nats Heartbeat RTT: %s", rtt);
-            });
-            try
-                t.join();
-            catch (Exception e) {
-                logWarn("nats.client: Heartbeat flush failed to sync.");
-                disconnect();
-            }
+            auto rtt = flush();
+            version (NatsClientLogging)
+                logDebug("nats.client: Nats Heartbeat RTT: %s", rtt);
         }
 
-        while(_connState == NatsState.CONNECTED) {
+        while(connected) {
             auto prevSent = _msgSent + _pingSent;
             auto prevRecv = _msgRecv + _pingRecv;
             timer.rearm(_config.heartbeatInterval, false);
@@ -447,8 +487,7 @@ final class Nats
                 logWarn("nats.client: Heartbeat timer interrupted.");
                 break;
             }
-            if (_msgSent + _pingSent == prevSent && _msgRecv + _pingRecv == prevRecv
-                    && _connState == NatsState.CONNECTED) {
+            if (_msgSent + _pingSent == prevSent && _msgRecv + _pingRecv == prevRecv && connected) {
                 version (NatsClientLogging) 
                     logDebugV("nats.client: Nats connection idle for %s. Sending heartbeat.", 
                             _config.heartbeatInterval);
@@ -467,7 +506,7 @@ final class Nats
     void sendPublish(T)(scope const(char)[] subject, scope const(T)[] payload, 
                             scope const(char)[] replySubject = null) @safe nothrow
         if (is(Unqual!T == ubyte) || is(Unqual!T == char))
-    // fixme: to allow for 
+    // fixme: to allow for headers 
     {
         try
             if (replySubject.length)
@@ -486,11 +525,11 @@ final class Nats
         } else {
             try {
                 // ensure we don't interleave other writes between writing PUB command & payload
-                _writeMutex.lock();
-                scope(exit) _writeMutex.unlock();
-                send();
-                write(payload);
-                write(CRLF);
+                synchronized (_writeMutex) {
+                    send();
+                    write(payload);
+                    write(CRLF);
+                }
             }       
             catch (Exception e) {
                 logError("nats.client: Publish failed (%s)", e.msg);
@@ -518,31 +557,29 @@ final class Nats
 
 
     /// Send the accumulated message(s) in the outbound buffer to the stream
-    void send(Flag!"isConnector" isConnector = No.isConnector) @safe nothrow
+    void send() @safe nothrow
     {
         version (NatsClientLogging) {
             auto bufferLen = _outBuffer[].length;
             logTrace("nats.client outBuffer send, length: %d, snippet: %s ...", 
                     bufferLen, _outBuffer[].assumeUTF[0 .. min(100, bufferLen)]);
         }
-        write(_outBuffer[], isConnector);
+        write(_outBuffer[]);
         _outBuffer.clear();
     }
 
 
     /// Write a buffer of bytes to the stream
-    void write(T)(scope const(T)[] buffer, Flag!"isConnector" isConnector = No.isConnector) @safe nothrow
+    void write(T)(scope const(T)[] buffer, Flag!"wait" wait = Yes.wait) @safe nothrow
         if (is(Unqual!T == char) || is(Unqual!T == ubyte))
     {
         ulong bytesWritten;
-        // block here and wait for connection, unless it is the connector task trying to write
-        while (!isConnector && !connected) {
-            logWarn("nats.client: Write task blocked waiting for connection (%s)", _connState);
-            _connStateChange.wait();
+        // block here and wait for connection, unless it is a connection related write
+        if (wait == Yes.wait && !connected) {
+            waitForConnection();
         }
         try {
-            synchronized(_writeMutex)
-            {
+            synchronized(_writeMutex) {
                 version (NatsClientLogging) logTrace("nats.client stream write, length: %d", buffer.length);
                 static if (is(Unqual!T == char))
                     bytesWritten = _natsStream.write(buffer.representation, IOMode.all);
@@ -571,7 +608,7 @@ final class Nats
     
         loop:
         // main message processing loop
-        while (connected || _connState == NatsState.CONNECTING) {
+        while (true) {
             // idle loop will block here until data available or socket drops
             auto result = _conn.waitForDataEx();
             if (result == WaitForDataStatus.noMoreData) {
@@ -584,8 +621,7 @@ final class Nats
             
             _natsStream.readLine(protocolLine);
             // skip any blank lines (ie lines with only a CRLF)
-            if (protocolLine[].length == 0) 
-                continue loop;
+            if (protocolLine[].length == 0) continue loop;
             version (NatsClientLogging)
                 logTrace("Sending NATS protocol line length %d to parseNats.", protocolLine[].length);
             parseNats(msg, protocolLine[]); 
@@ -631,7 +667,7 @@ final class Nats
                     continue loop;
                 
                 case NatsResponse.PING:
-                    write("PONG\r\n");
+                    write("PONG\r\n", No.wait);
                     _pongSent++;
                     version (NatsClientLogging) logDebugV("nats.client: Pong sent.");
                     continue loop;
@@ -662,8 +698,8 @@ final class Nats
         // copy the message payload as we will be retaining it
         string serverjson = msg.payloadAsString.idup;
         _info = parseJsonString(serverjson);
-        // check if we need to switch to TLS
-        _useTls = _info["tls_required"].get!bool;
+        // check if we need to switch to TLS, default is false
+        _useTls = _info["tls_required"].opt!bool;
         if (_useTls) {
             // if so, wrap the TCP connection in a TLS stream
             auto tlsContext = createTLSContext(TLSContextKind.client);

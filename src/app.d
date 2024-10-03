@@ -23,7 +23,7 @@ void main(string[] args)
             // use giant try/catch bazooka to ensure task is nothrow
             // this is needed to avoid deprecations in vibe-core 1.18+
             try {
-                sleep(50.msecs);
+                natsConn.waitForConnection();
                 natsConn.subscribe(">", toDelegate(&sub_all_handler));
                 logInfo("Sent subscribe all.");
                 auto greets = natsConn.subscribe("greetings", toDelegate(&greetings_handler));
