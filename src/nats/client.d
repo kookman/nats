@@ -8,7 +8,7 @@ import std.exception;
 public import nats.interface_;
 import nats.parser;
 
-enum VERSION = "nats_v0.5.2";
+enum VERSION = "nats_v0.6.0";
 
 // Allow quietening the debug logging from nats client
 version (NatsClientQuiet) {}
@@ -50,6 +50,7 @@ final class Nats
         string pass;
         bool verbose;
         bool pedantic;
+        bool headers = true;
     }
 
     static struct Statistics
@@ -97,7 +98,8 @@ final class Nats
         _flushSync = new TaskCondition(_flushMutex);
         // reserve a sensible minimum amount of space for new subscriptions
         _subs.reserve(16);
-        // setup initial outbound NATS buffer size
+        // setup initial outbound NATS buffer sizes
+        _headerBuffer.reserve(1024);
         _outBuffer.reserve(64 * 1024);
     }
 
@@ -127,6 +129,12 @@ final class Nats
     {
         return getState() == NatsState.CONNECTED;
     }
+
+    bool natsHeadersSupport() @safe const nothrow
+    {
+        return _natsHeadersSupport;
+    }
+
 
     NatsState getState() @safe const nothrow
     {
@@ -207,20 +215,21 @@ final class Nats
     }
 
 
-    void publish(T)(scope const(char)[] subject, scope const(T)[] payload) @safe nothrow
+    void publish(T)(in char[] subject, in T[] payload, in InetHeaderMap headers = InetHeaderMap.init) @safe nothrow
         if (is(Unqual!T == ubyte) || is(Unqual!T == char))
     {
-        sendPublish(subject, payload);
+        sendPublish(subject, payload, headers);
     }
 
 
-    void publishRequest(T)(scope const(char)[] subject, scope const(T)[] payload, NatsHandler handler) @safe nothrow
+    void publishRequest(T)(in char[] subject, in T[] payload, NatsHandler handler,
+                            in InetHeaderMap headers = InetHeaderMap.init) @safe nothrow
         if (is(Unqual!T == ubyte) || is(Unqual!T == char))
     {
         auto inboxId = to!string(_msgSent);
         _inboxes[_msgSent] = handler;
         auto replyInbox = _inboxPrefix ~ inboxId;
-        sendPublish(subject, payload, replyInbox);
+        sendPublish(subject, payload, headers, replyInbox);
     }
 
 
@@ -297,11 +306,13 @@ final class Nats
     string               _host;
     ushort               _port;
     bool 				 _useTls;
+    bool                 _natsHeadersSupport;
     NatsState			 _connState;
     string               _inboxPrefix;
     NatsHandler[uint]    _inboxes;
     ubyte[]              _payloadBuffer;
     Appender!(ubyte[])   _outBuffer;
+    Appender!(ubyte[])   _headerBuffer;
 
 
     void setState(NatsState desiredState, Flag!"notify" notify = Yes.notify) @safe nothrow
@@ -532,41 +543,69 @@ final class Nats
     }
 
 
-    void sendPublish(T)(scope const(char)[] subject, scope const(T)[] payload, 
-                            scope const(char)[] replySubject = null) @safe nothrow
+    void sendPublish(T)(in char[] subject, in T[] payload, in InetHeaderMap headers, 
+                        in char[] replySubject = null) @safe nothrow
         if (is(Unqual!T == ubyte) || is(Unqual!T == char))
     // fixme: to allow for headers 
     {
-        try
-            if (replySubject.length)
-                _outBuffer.formattedWrite!"PUB %s %s %s\r\n"(subject, replySubject, payload.length);
-            else
-                _outBuffer.formattedWrite!"PUB %s %s\r\n"(subject, payload.length);
-        catch (Exception e)
-            logError("nats.client: Exception writing PUB cmd to output buffer. (%s)", e.msg);
-        if (payload.length + 2 < _outBuffer.capacity) {
-            static if (is(Unqual!T == char))
-                _outBuffer ~= payload.representation;
-            else
-                _outBuffer ~= payload;
-            _outBuffer ~= CRLF;
-            send();
-        } else {
-            try {
+        try {
+            if (_natsHeadersSupport && headers.length > 0) {
+                // Add "H" prefix to buffer first to indicate headers
+                _outBuffer.put("H".representation);
+            }
+            _outBuffer ~= "PUB ".representation;
+            _outBuffer ~= subject.representation;
+            _outBuffer ~= SPACE;
+            if (replySubject.length) {
+                _outBuffer ~= replySubject.representation;
+                _outBuffer ~= SPACE;
+            }
+            if (headers.length > 0) {
+                if (_natsHeadersSupport) {
+                    _headerBuffer.clear();
+                    _headerBuffer ~= NatsHeaderLine.representation;
+                    _headerBuffer ~= CRLF;
+                    // make @trusted to work around scope problem with byKeyValue().
+                    // This is still @safe because we are only writing the values to the buffer and
+                    // not retaining any references
+                    () @trusted { foreach (k, v; headers.byKeyValue()) {
+                                _headerBuffer.formattedWrite!"%s: %s\r\n"(k, v);                    
+                            }
+                    } ();
+                    _headerBuffer ~= CRLF;
+                    auto headerLength = _headerBuffer[].length;
+                    _outBuffer.formattedWrite!"%s %s\r\n"(headerLength, headerLength + payload.length);
+                    _outBuffer ~= _headerBuffer[];
+                } else {
+                    logError("nats.client: Tried to publish with headers (HPUB), but the" ~ 
+                            " connected Nats server does not allow headers.");
+                    _outBuffer.formattedWrite!"%s\r\n"(payload.length);
+                }
+            } else {
+                _outBuffer.formattedWrite!"%s\r\n"(payload.length);
+            }
+            if (payload.length + 2 < _outBuffer.capacity) {
+                static if (is(Unqual!T == char))
+                    _outBuffer ~= payload.representation;
+                else
+                    _outBuffer ~= payload;
+                _outBuffer ~= CRLF;
+                send();
+            } else {
                 // ensure we don't interleave other writes between writing PUB command & payload
                 synchronized (_writeMutex) {
                     send();
                     write(payload);
                     write(CRLF);
                 }
-            }       
-            catch (Exception e) {
-                logError("nats.client: Publish failed (%s)", e.msg);
-                disconnect();
+            _payloadBytesSent += payload.length;
+            _msgSent++;
             }
         }
-        _payloadBytesSent += payload.length;
-        _msgSent++;
+        catch (Exception e) {
+            logError("nats.client: Publish failed (%s)", e.msg);
+            disconnect();
+        }
     }
 
 
@@ -620,7 +659,9 @@ final class Nats
             logError("nats.client: Exception writing to Nats stream (%s).", e.msg);          
         if (bytesWritten != buffer.length)
         {
-            logError("nats.client: Error writing to Nats stream. Expected to write %d bytes, wrote %d.");
+            logError("nats.client: Error writing to Nats stream. Expected to write %d bytes, wrote %d.",
+                buffer.length, bytesWritten);
+            disconnect();
         }
     }
 
@@ -647,13 +688,13 @@ final class Nats
             Msg msg;
             protocolLine.clear();
             statusLine.clear();
-            
             _natsStream.readLine(protocolLine);
             // skip any blank lines (ie lines with only a CRLF)
             if (protocolLine[].length == 0) continue loop;
-            version (NatsClientLogging)
-                logTrace("Sending NATS protocol line length %d to parseNats.", protocolLine[].length);
             parseNats(msg, protocolLine[]); 
+            version (NatsClientLogging)
+                logTrace("nats.client: %s received. Header length: %d, payload length: %d.", msg.type, 
+                    msg.headersLength, msg.length);
 
             final switch (msg.type)
             {	
@@ -670,6 +711,12 @@ final class Nats
                         if (msg.headersLength - msg.headerStatusLine.length > 4) {
                             // 4 is the length of the trailing double CRLF so there are more headers
                             _natsStream.parseRFC5322Header(msg.headers);
+                        }
+                        else {
+                            // skip over remaining CRLF from double CRLF after status line
+                            ubyte[2] trailer;
+                            _natsStream.read(trailer, IOMode.all);
+                            assert (trailer == CRLF);
                         }
                     }
                     immutable expectedPayload = msg.length - msg.headersLength;
@@ -727,6 +774,7 @@ final class Nats
         // copy the message payload as we will be retaining it
         string serverjson = msg.payloadAsString.idup;
         _info = parseJsonString(serverjson);
+        _natsHeadersSupport = _info["headers"].opt!bool;
         // check if we need to switch to TLS, default is false
         _useTls = _info["tls_required"].opt!bool;
         if (_useTls) {

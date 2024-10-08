@@ -20,8 +20,8 @@ enum INFO = "INFO".representation;
 enum ERR = "-ERR".representation;
 enum CRLF = "\r\n".representation;
 enum SPACE = " ".representation;
-enum TAB = "\t".representation;
 
+enum NatsHeaderLine = "NATS/1.0";
 
 void parseNats(R)(return ref Msg msg, R protocolLine) @safe
     if (isInputRange!R && is(Unqual!(ElementType!R) == ubyte))
@@ -31,28 +31,24 @@ void parseNats(R)(return ref Msg msg, R protocolLine) @safe
     import std.algorithm.iteration: splitter;
     import std.ascii: isDigit;
     import std.conv: to;
+    import std.range: dropOne;
 
     bool msgWithHeaders = protocolLine.startsWith(HMSG);
     if (msgWithHeaders || protocolLine.startsWith(MSG))
     {
-        auto tokens = protocolLine.assumeUTF.splitter;
-        tokens.popFront();
+        auto tokens = protocolLine.assumeUTF.splitter.dropOne();
         msg.subject = tokens.front;
         tokens.popFront();
         msg.sid = tokens.front.to!uint;
         tokens.popFront();
-        if (!tokens.front[0].isDigit)
-        {
+        if (!tokens.front[0].isDigit) {
             msg.type = NatsResponse.MSG_REPLY;
             msg.replySubject = tokens.front;
             tokens.popFront();
-        }
-        else
-        {
+        } else {
             msg.type = NatsResponse.MSG;
         }
-        if (msgWithHeaders)
-        {
+        if (msgWithHeaders) {
             msg.headersLength = tokens.front.to!uint;
             tokens.popFront();
         }
@@ -94,12 +90,10 @@ void parseNats(R)(return ref Msg msg, R protocolLine) @safe
 
 unittest {
     enum test_msg = "MSG notices 1 12\r\nHello world!".representation;
-    enum test_msg_w_reply = "MSG notices 12 reply 29\r\nHello world - please respond!".representation;
-    enum info = `INFO {"server_id":"p5YHW98yUXPd3BTRHoBNAE","version":"1.4.1","proto":1,`.representation
-        ~ `"go":"go1.11.5","host":"0.0.0.0","port":4222,"max_payload":1048576,"client_id":12}`.representation;
+    enum test_msg_w_reply = "MSG notices 12 reply 29\r\nHello world - please respond!";
+    enum info = `INFO {"server_id":"p5YHW98yUXPd3BTRHoBNAE","version":"1.4.1","proto":1,`
+        ~ `"go":"go1.11.5","host":"0.0.0.0","port":4222,"max_payload":1048576,"client_id":12}`;
 
-    static assert (isInputRange!(typeof(test_msg)));
-    static assert (is(Unqual!(ElementType!(typeof(test_msg))) == ubyte));
     void d_parser_tests()
     { 
         Msg msg1, msg2;
@@ -110,7 +104,7 @@ unittest {
         assert(msg1.sid == 1);
         assert(msg1.length == 12);
 
-        parseNats(msg2, test_msg_w_reply);
+        parseNats(msg2, test_msg_w_reply.representation);
         assert(msg2.type == NatsResponse.MSG_REPLY);
         assert(msg2.subject == "notices");
         assert(msg2.replySubject == "reply");
@@ -118,7 +112,7 @@ unittest {
         assert(msg2.length == 29);
 
         msg1 = Msg.init;
-        parseNats(msg1, info);
+        parseNats(msg1, info.representation);
         assert(msg1.type == NatsResponse.INFO);
         assert(msg1.payloadAsString == 
             `{"server_id":"p5YHW98yUXPd3BTRHoBNAE","version":"1.4.1","proto":1,`

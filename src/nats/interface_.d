@@ -1,7 +1,7 @@
 module nats.interface_;
 
 public import core.time: Duration, seconds;
-import vibe.inet.message: InetHeaderMap;
+public import vibe.inet.message: InetHeaderMap;
 
 struct Msg
 {

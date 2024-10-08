@@ -28,6 +28,12 @@ void main(string[] args)
             auto shutdown = natsConn.subscribe("exit", toDelegate(&shutdown_handler));
             natsConn.publish("back_channel", "This came on the back channel...");
             natsConn.publish("greetings", "Hello to all greetings subscribers!");
+            if (natsConn.natsHeadersSupport) {
+                InetHeaderMap headers;
+                headers.addField("BREAKFAST", "donut");
+                headers.addField("BREAKFAST", "eggs");
+                natsConn.publish("morning.menu", "Yum!", headers);
+            }
             // make sure messages have a chance to arrive before unsubsribing from greetings
             try
                 sleep(50.msecs);

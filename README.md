@@ -27,7 +27,7 @@ Current features supported:
 - [x] Support distributed queues (subscriber groups)
 - [x] Disconnect/clean shutdown
 - [ ] Support Nats 2.0 Nkey-based authentication
-- [ ] Support HPUB/HMSG (Nats message headers)
+- [X] Support HPUB/HMSG (Nats message headers)
 - [ ] ? Add support for Jetstream (perhaps belongs in a separate module from the basic client)
 - [ ] ? Support (de)serialisation protocols: msgpack, cerealed, none (passthru ubyte[])
 
